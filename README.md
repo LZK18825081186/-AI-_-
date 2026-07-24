@@ -1,82 +1,141 @@
 # 闲鱼 COS 服租赁 AI 自动回复系统
 
-基于 WebSocket 实时消息的闲鱼自动回复机器人，支持 DeepSeek AI 智能问答 + 飞书多维表格库存知识库。
+基于 WebSocket 实时消息的闲鱼自动回复机器人，支持 DeepSeek AI 智能问答 + 飞书多维表格库存知识库 + 本地 VL 模型自动生成图片描述。
 
 ## 功能
 
-- 🤖 **AI 智能回复**：DeepSeek V4 Flash 驱动，根据买家问题自动生成回复
-- 📊 **飞书库存知识库**：客服在飞书表格里改库存，AI 立刻知道
-- 🔔 **飞书通知**：重要消息（投诉/退款等）自动推送到飞书
-- 🖥️ **Web 管理面板**：可视化配置关键词回复、AI 设置等
-- 🐳 **Docker 部署**：一键启动，无需安装 Python 环境
+- 🤖 **AI 智能回复**：DeepSeek / DashScope 驱动，根据买家问题自动生成回复
+- 📊 **飞书库存知识库**：多维表格改库存，AI 立刻知道
+- 🖼️ **图片自动描述**：Qwen3.6-35B-A3B 本地 VL 模型识别实物图，DeepSeek 汇总为详细描述
+- 🔔 **飞书通知**：投诉/退款等自动推送到飞书
+- 🖥️ **Web 管理面板**：可视化配置关键词回复、AI 设置
+- 🐳 **Docker 一键部署**：含内置 CookieCloud 服务
 
 ## 快速开始（Docker）
 
 ### 前提条件
-- 安装 [Docker](https://docs.docker.com/get-docker/) 和 Docker Compose
-- 一个闲鱼卖家账号
--（可选）CookieCloud 服务用于自动同步 Cookie
 
-### 1. 配置环境变量
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/)（Win/Mac）或 Docker Engine（Linux）
+- Edge 浏览器（装 CookieCloud 插件用）
+- 一个闲鱼卖家账号
+
+### 1. 克隆项目
+
+```bash
+git clone https://github.com/LZK18825081186/-AI-_-
+cd -AI-_-
+```
+
+### 2. 编辑配置
+
+复制并编辑环境变量文件：
 
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env` 文件，至少设置以下变量：
+至少填入以下内容：
 
 ```env
-# 必填：管理后台账号密码
-ADMIN_USERNAME=your_username
-ADMIN_PASSWORD=your_secure_password
-JWT_SECRET_KEY=your_random_secret_key
+# 飞书多维表格（库存数据）
+FEISHU_BASE_TOKEN=你的飞书BaseToken
+FEISHU_TABLE_ID=你的飞书TableID
 
-# 可选：CookieCloud（自动同步闲鱼Cookie）
-COOKIE_CLOUD_HOST=http://your-cookiecloud-server:8088
-COOKIE_CLOUD_UUID=your_uuid
-COOKIE_CLOUD_PASSWORD=your_password
+# DeepSeek API（AI 回复 + 图片汇总）
+DEEPSEEK_API_KEY=sk-你的DeepSeek密钥
+
+# 管理后台
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=你的密码
+JWT_SECRET_KEY=随机字符串
+
+# 远程图片理解模型（可选，默认本机 LM Studio）
+# LM_STUDIO_URL=http://192.168.1.100:1234
 ```
 
-### 2. 启动
+### 3. 一键部署
+
+**Windows**：双击 `setup.bat`
+
+**Linux/Mac**：
 
 ```bash
-docker-compose up -d
+chmod +x setup.sh && ./setup.sh
 ```
 
-### 3. 访问管理面板
+脚本会自动：
+- 拉取 Docker 镜像
+- 启动内置 CookieCloud 服务
+- 打开浏览器引导安装 CookieCloud 插件
+- 等待你登录闲鱼
+- 启动全部服务
 
-浏览器打开 `http://localhost:8080`，用你设置的账号密码登录。
+### 4. 登录管理后台
 
-## 手动配置（不用 CookieCloud）
+打开 `http://localhost:8080`，用 `.env` 中设置的用户名密码登录。
 
-如果不使用 CookieCloud，可以手动导入 Cookie：
+## 手动启动（不依赖 Docker）
 
-1. 登录管理面板
-2. 进入「Cookie 管理」→「添加 Cookie」
-3. 从浏览器开发者工具复制闲鱼 Cookie 粘贴进去
+```bash
+# 安装依赖
+pip install -r requirements.txt
+
+# 配置环境变量后启动
+FEISHU_BASE_TOKEN=xxx FEISHU_TABLE_ID=xxx \
+DEEPSEEK_API_KEY=sk-xxx \
+COOKIE_CLOUD_HOST=http://localhost:8088 \
+COOKIE_CLOUD_UUID=xxx COOKIE_CLOUD_PASSWORD=xxx \
+python Start.py
+```
+
+## 图片描述生成
+
+上传 cos 服实测图到飞书多维表格的「实物图」字段后，系统自动：
+
+```
+多张照片 → Qwen3.6-35B-A3B 分批视觉推理（2张/批）
+    → DeepSeek 汇总为结构化质检报告
+    → 写入「图片描述」字段
+    → 勾选「描述已审核」后买家可见
+```
+
+### 远程 LM Studio
+
+如果本地显卡不够（12GB 显存跑 22GB 模型会 CPU offload），可以在另一台电脑运行 LM Studio，然后在 `.env` 中指定：
+
+```env
+LM_STUDIO_URL=http://192.168.1.100:1234
+```
+
+要求远程机器 LM Studio 设置中绑定 `0.0.0.0` 并放行 1234 端口。
 
 ## 配置 AI 回复
 
-1. 登录管理面板，进入「AI 回复设置」
-2. 填写 API Key 和 Base URL（如 DeepSeek: `https://api.deepseek.com/v1`）
-3. 选择模型（推荐 `deepseek-chat`）
-4. 开启 AI 回复
+登录管理后台 → 「AI 回复设置」：
 
-## 配置知识库
+- API 地址：`https://api.deepseek.com/v1`
+- API Key：你的 DeepSeek 密钥
+- 模型：`deepseek-chat`
 
-### 方式一：飞书多维表格（推荐）
+## 配置飞书知识库
 
-在飞书中创建一个多维表格存放库存数据，格式参考：
+在飞书「零花钱」群中创建一个多维表格，包含以下字段：
 
-| 角色名称 | 作品来源 | 码数 | 总库存 | 已租出 | 状态 | 租期价格 | 押金 |
-|---------|---------|------|--------|--------|------|---------|------|
-| 雷电将军 | 原神 | M | 2 | 0 | 可租 | 400元/3天 | 200 |
-
-然后修改 `ai_reply_engine.py` 中的 `_load_knowledge_base()` 方法，将 `base_token` 和 `table_id` 改为你的表格 ID。
-
-### 方式二：本地文件
-
-直接编辑项目根目录的 `knowledge_base.txt`，AI 会自动读取。
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| 角色名称 | 文本 | 如：银狼 |
+| 作品来源 | 文本 | 如：崩坏星穹铁道 |
+| 码数 | 单选 | M / L / 均码 |
+| 总库存 | 数字 | 共几套 |
+| 已租出 | 数字 | 已租几套 |
+| 状态 | 单选 | 可租/已租出/待归还/维护中 |
+| 租期价格 | 文本 | 如：350元/3天 |
+| 押金 | 数字 | 押金金额 |
+| 日租金底价 | 数字 | 砍价底线 |
+| 配件清单 | 文本 | 包含哪些配件 |
+| 实物图 | 附件 | cos 服照片（支持多张） |
+| 图片描述 | 文本 | AI 自动生成，只读 |
+| 描述已审核 | 复选框 | 人工确认后买家可见 |
 
 ## 项目结构
 
@@ -84,19 +143,36 @@ docker-compose up -d
 xianyu-direct/
 ├── Start.py              # 启动入口
 ├── XianyuAutoAsync.py    # 主逻辑（WebSocket + 消息处理）
-├── ai_reply_engine.py    # AI 回复引擎
+├── ai_reply_engine.py    # AI 回复引擎 + VL 图片描述
 ├── reply_server.py       # Web 管理面板 API
 ├── db_manager.py         # 数据库管理
 ├── cookie_manager.py     # Cookie 管理
 ├── global_config.yml     # 全局配置
-├── Dockerfile            # Docker 镜像
 ├── docker-compose.yml    # Docker 编排
+├── setup.bat / setup.sh  # 一键部署脚本
+├── stop.bat              # 停止脚本
 └── utils/                # 工具模块
+```
+
+## 验证
+
+```bash
+# 停止系统
+./stop.bat  # Windows
+docker-compose down  # Linux
+
+# 查看日志
+docker-compose logs -f
+
+# 重启
+docker-compose up -d
 ```
 
 ## 注意事项
 
-- 系统使用无头浏览器自动维护 Cookie，需要 Chromium 浏览器
-- 长时间不登录闲鱼可能导致 Cookie 过期，需要重新导入
-- AI 回复仅在关键词匹配失败时触发（优先级：关键词 > AI > 默认回复）
-- 如果你手动回复了某个买家，AI 会暂停对该买家的自动回复 10 分钟
+- 使用 CookieCloud 自动同步 Cookie，需保持 Edge 浏览器登录闲鱼
+- 长时间不登录闲鱼可能导致 Cookie 过期
+- AI 回复优先级：关键词匹配 > AI 生成 > 默认兜底
+- 手动回复某个买家后，AI 自动暂停对该买家回复 10 分钟
+- `token.txt` 和 `xianyu_data.db` 包含敏感信息，已列入 `.gitignore`
+- 飞书 `base_token` 和 `table_id` 必须通过 `.env` 环境变量配置，不可写死
