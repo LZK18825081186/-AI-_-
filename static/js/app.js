@@ -86,6 +86,9 @@ function showSection(sectionName) {
     case 'auto-reply':      // 【自动回复菜单】
         refreshAccountList();
         break;
+    case 'ai-reply-settings': // 【AI回复设置菜单】
+        loadGlobalAIReplySettings();
+        break;
     case 'cards':           // 【卡券管理菜单】
         loadCards();
         break;
@@ -10454,6 +10457,69 @@ async function showUpdateInfo(newVersion) {
     // 显示模态框
     const modal = new bootstrap.Modal(document.getElementById('updateModal'));
     modal.show();
+}
+
+// ==================== AI 回复设置独立面板 ====================
+
+async function loadGlobalAIReplySettings() {
+    try {
+        const settings = await fetchJSON(`${apiBase}/ai-reply-settings/default`);
+        document.getElementById('globalAIModel').value = settings.model || 'deepseek-chat';
+        document.getElementById('globalAIBaseURL').value = settings.base_url || 'https://api.deepseek.com/v1';
+        document.getElementById('globalAIKey').value = settings.api_key || '';
+        document.getElementById('globalAIPrompt').value = settings.system_prompt || '';
+    } catch (e) {
+        // 静默失败，面板允许手动填写
+    }
+}
+
+async function saveGlobalAIReplySettings() {
+    const model = document.getElementById('globalAIModel').value.trim();
+    const base_url = document.getElementById('globalAIBaseURL').value.trim();
+    const api_key = document.getElementById('globalAIKey').value.trim();
+    const system_prompt = document.getElementById('globalAIPrompt').value.trim();
+    
+    if (!api_key) {
+        alert('请填写 API Key');
+        return;
+    }
+    
+    try {
+        await fetchJSON(`${apiBase}/ai-reply-settings`, {
+            method: 'POST',
+            body: JSON.stringify({
+                cookie_id: 'default',
+                ai_enabled: true,
+                model: model,
+                base_url: base_url,
+                api_key: api_key,
+                system_prompt: system_prompt
+            })
+        });
+        showToast('success', 'AI 设置已保存');
+    } catch (e) {
+        showToast('danger', '保存失败: ' + e.message);
+    }
+}
+
+async function testGlobalAIReply() {
+    const testInput = prompt('输入测试买家消息:', '有什么可以租的？');
+    if (!testInput) return;
+    
+    try {
+        const resp = await fetchJSON(`${apiBase}/test-ai-reply`, {
+            method: 'POST',
+            body: JSON.stringify({
+                message: testInput,
+                cookie_id: 'default'
+            })
+        });
+        document.getElementById('globalAITestResult').style.display = 'block';
+        document.getElementById('globalAITestContent').textContent = resp.reply || '(无回复)';
+    } catch (e) {
+        document.getElementById('globalAITestResult').style.display = 'block';
+        document.getElementById('globalAITestContent').textContent = '错误: ' + e.message;
+    }
 }
 
 
