@@ -14,6 +14,17 @@ from urllib.parse import urlparse
 from pathlib import Path
 from loguru import logger
 
+# 自动加载 .env 文件中的环境变量
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).parent / '.env'
+    if _env_path.exists():
+        load_dotenv(_env_path)
+    else:
+        load_dotenv()  # fallback: search parent dirs
+except ImportError:
+    pass  # python-dotenv 未安装时静默跳过
+
 # 修复Linux环境下的asyncio子进程问题
 if sys.platform.startswith('linux'):
     try:

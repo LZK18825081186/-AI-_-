@@ -18,8 +18,11 @@ LM_STUDIO_URL = os.environ.get("LM_STUDIO_URL", "http://localhost:1234")
 # 飞书多维表格访问凭证（必须通过 .env 或环境变量配置）
 FEISHU_BASE_TOKEN = os.environ.get("FEISHU_BASE_TOKEN", "")
 FEISHU_TABLE_ID = os.environ.get("FEISHU_TABLE_ID", "")
-if not FEISHU_BASE_TOKEN or not FEISHU_TABLE_ID:
-    raise RuntimeError("请设置 FEISHU_BASE_TOKEN 和 FEISHU_TABLE_ID 环境变量（或在 .env 中配置）")
+
+def _ensure_feishu_config():
+    """惰性检查：只在首次调用飞书 API 时才触发，不阻塞模块 import"""
+    if not FEISHU_BASE_TOKEN or not FEISHU_TABLE_ID:
+        raise RuntimeError("请设置 FEISHU_BASE_TOKEN 和 FEISHU_TABLE_ID 环境变量（在 .env 或系统环境变量中配置）")
 
 
 class AIReplyEngine:
@@ -39,6 +42,7 @@ class AIReplyEngine:
     
     def _start_auto_sync_timer(self):
         """启动后台定时器，每5分钟检查飞书新图片并自动生成描述"""
+        _ensure_feishu_config()
         import threading
         base_token = FEISHU_BASE_TOKEN
         table_id = FEISHU_TABLE_ID
@@ -375,6 +379,7 @@ class AIReplyEngine:
 
     def _load_knowledge_base(self) -> str:
         """从飞书多维表格同步库存数据到本地缓存，返回知识库内容"""
+        _ensure_feishu_config()
         kb_path = os.path.join(os.path.dirname(__file__), 'knowledge_base.txt')
         base_token = FEISHU_BASE_TOKEN
         table_id = FEISHU_TABLE_ID
@@ -824,6 +829,7 @@ class AIReplyEngine:
 
     def _get_accessories_by_product_name(self, product_name: str) -> str:
         """从飞书多维表格获取商品配件清单文本"""
+        _ensure_feishu_config()
         import subprocess, json as _json
         try:
             lark_cli = self._get_lark_cli_path()
@@ -1028,6 +1034,7 @@ class AIReplyEngine:
 
     def _upsert_product_description(self, product_name: str, unified_desc: str) -> int:
         """将统一描述写入该商品所有飞书记录"""
+        _ensure_feishu_config()
         import json as _json, subprocess
         lark_cli = self._get_lark_cli_path()
         base_token = FEISHU_BASE_TOKEN
@@ -1186,6 +1193,7 @@ class AIReplyEngine:
 
     def _upsert_image_description(self, record_id: str, description: str) -> bool:
         """将图片描述写回飞书表格"""
+        _ensure_feishu_config()
         import subprocess
         lark_cli = self._get_lark_cli_path()
         base_token = FEISHU_BASE_TOKEN
