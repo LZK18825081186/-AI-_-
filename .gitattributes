@@ -1,0 +1,25 @@
+# 强制 Linux 关键文件使用 LF 换行符
+# 避免 Windows 上 CRLF 导致 Docker 容器脚本执行失败
+
+# Shell 脚本
+*.sh text eol=lf
+entrypoint.sh text eol=lf
+
+# Docker 相关
+Dockerfile text eol=lf
+Dockerfile-cn text eol=lf
+docker-compose.yml text eol=lf
+docker-compose-cn.yml text eol=lf
+.dockerignore text eol=lf
+
+# 配置文件
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+.env.example text eol=lf
+.gitignore text eol=lf
+
+# Windows 批处理保持 CRLF
+*.bat text eol=crlf
