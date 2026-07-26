@@ -169,28 +169,6 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 :: ============================================
-:: 开机自启（可选）
-:: ============================================
-echo.
-:: 从 .env 读取 STARTUP_MODE
-for /f "tokens=2 delims==" %%a in ('type .env ^| findstr "STARTUP_MODE" 2^>nul') do set STARTUP_MODE=%%a
-if /i "%STARTUP_MODE%"=="auto" (
-    echo   [开机自启] 正在安装...
-    set "STARTUP_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
-    set "TARGET_BAT=%~dp0start.bat"
-    set "VBS_FILE=%TEMP%\xianyu_launcher.vbs"
-    echo Set WshShell = CreateObject("WScript.Shell") > "%VBS_FILE%"
-    echo WshShell.Run """%TARGET_BAT%""", 0, False >> "%VBS_FILE%"
-    copy /Y "%VBS_FILE%" "%STARTUP_DIR%\闲鱼AI客服.vbs" >nul 2>&1
-    if %ERRORLEVEL% EQU 0 (
-        echo   ✅ 开机自启已安装
-    )
-) else (
-    echo   [开机自启] 未启用（STARTUP_MODE=manual）
-    echo   如需启用，修改 .env 中 STARTUP_MODE=auto 后重新运行本脚本
-)
-
-:: ============================================
 :: 完成
 :: ============================================
 echo.
@@ -199,8 +177,8 @@ echo   🎉 部署完成！
 echo =============================================
 echo.
 echo   管理后台: http://localhost:8080
-echo   停止系统: 双击 stop.bat
-echo   查看日志: docker-compose logs -f
+echo   停止系统: docker compose down
+echo   查看日志: docker compose logs -f
 echo.
 echo   用户名和密码见 .env 文件
 echo.
