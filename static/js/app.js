@@ -1087,9 +1087,13 @@ async function fetchJSON(url, opts = {}) {
     toggleLoading(true);
     try {
     // 添加认证头
+    opts.headers = opts.headers || {};
     if (authToken) {
-        opts.headers = opts.headers || {};
         opts.headers['Authorization'] = `Bearer ${authToken}`;
+    }
+    // POST/PUT 请求时自动添加 Content-Type
+    if (opts.body && !opts.headers['Content-Type']) {
+        opts.headers['Content-Type'] = 'application/json';
     }
 
     const res = await fetch(url, opts);
@@ -2969,8 +2973,8 @@ function renderNotificationChannels(channels) {
     if (channels.length === 0) {
     tbody.innerHTML = `
         <tr>
-        <td colspan="6" class="text-center py-4 text-muted">
-            <i class="bi bi-bell fs-1 d-block mb-3"></i>
+        <td colspan="6" class="text-center py-4 channels-empty-state">
+            <i class="bi bi-bell-slash d-block mb-3"></i>
             <h5>暂无通知渠道</h5>
             <p class="mb-0">点击上方按钮添加通知渠道</p>
         </td>
@@ -7196,41 +7200,43 @@ async function checkQRCodeStatus() {
 // 显示需要验证的提示
 function showVerificationRequired(data) {
     if (data.verification_url) {
-    // 隐藏二维码区域
     document.getElementById('qrCodeContainer').style.display = 'none';
     document.getElementById('qrCodeImage').style.display = 'none';
 
-    // 显示验证提示
     const verificationHtml = `
-        <div class="text-center">
-        <div class="mb-4">
-            <i class="bi bi-shield-exclamation text-warning" style="font-size: 4rem;"></i>
+        <div class="text-center verification-panel">
+        <div class="mb-3">
+            <i class="bi bi-shield-exclamation text-warning" style="font-size: 3rem;"></i>
         </div>
-        <h5 class="text-warning mb-3">账号需要手机验证</h5>
-        <div class="alert alert-warning border-0 mb-4">
-            <i class="bi bi-info-circle me-2"></i>
-            <strong>检测到账号存在风控，需要进行手机验证才能完成登录</strong>
+        <h6 class="text-warning mb-2">风控验证 — 需要手机验证码</h6>
+        <p class="text-muted small mb-3">闲鱼检测到此账号需要安全验证</p>
+
+        <div class="iframe-wrapper mb-3" style="border:2px solid #ffc107; border-radius:8px; overflow:hidden; max-height:420px;">
+            <iframe src="${data.verification_url}"
+                style="width:100%; height:420px; border:none;"
+                sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+                loading="lazy"
+                onerror="document.getElementById('iframeFallback').style.display='block';">
+            </iframe>
+            <div id="iframeFallback" style="display:none; padding:40px 20px; text-align:center; background:#fffbe6;">
+                <i class="bi bi-window-stack text-warning" style="font-size:2rem;"></i>
+                <p class="mt-2 mb-3">无法在弹窗内验证，请在外部窗口完成</p>
+                <a href="${data.verification_url}" target="_blank"
+                   class="btn btn-outline-warning"
+                   onclick="document.getElementById('btnVerifyDone').style.display='inline-block';">
+                    <i class="bi bi-box-arrow-up-right me-1"></i>打开验证页面
+                </a>
+            </div>
         </div>
-        <div class="mb-4">
-            <p class="text-muted mb-3">请点击下方按钮，在新窗口中完成手机验证：</p>
-            <a href="${data.verification_url}" target="_blank" class="btn btn-warning btn-lg">
-            <i class="bi bi-phone me-2"></i>
-            打开手机验证页面
-            </a>
-        </div>
-        <div class="alert alert-info border-0">
-            <i class="bi bi-lightbulb me-2"></i>
-            <small>
-            <strong>验证步骤：</strong><br>
-            1. 点击上方按钮打开验证页面<br>
-            2. 按照页面提示完成手机验证<br>
-            3. 验证完成后，重新扫码登录
-            </small>
-        </div>
+
+        <button id="btnVerifyDone" class="btn btn-success px-4" style="display:none;"
+                onclick="refreshQRCode(); this.style.display='none';">
+            <i class="bi bi-arrow-repeat me-1"></i>验证完成，重新扫码
+        </button>
+        <small class="d-block text-muted mt-2" id="verifyHint">完成手机验证后点击上方按钮</small>
         </div>
     `;
 
-    // 创建验证提示容器
     let verificationContainer = document.getElementById('verificationContainer');
     if (!verificationContainer) {
         verificationContainer = document.createElement('div');
@@ -7241,8 +7247,14 @@ function showVerificationRequired(data) {
     verificationContainer.innerHTML = verificationHtml;
     verificationContainer.style.display = 'block';
 
-    // 显示Toast提示
-    showToast('账号需要手机验证，请按照提示完成验证', 'warning');
+    setTimeout(() => {
+        const btn = document.getElementById('btnVerifyDone');
+        const hint = document.getElementById('verifyHint');
+        if (btn) btn.style.display = 'inline-block';
+        if (hint) hint.textContent = '看到验证通过后点击重新扫码按钮';
+    }, 6000);
+
+    showToast('账号需要手机验证，请在弹窗中完成验证', 'warning');
     }
 }
 
@@ -10496,9 +10508,9 @@ async function saveGlobalAIReplySettings() {
                 system_prompt: system_prompt
             })
         });
-        showToast('success', 'AI 设置已保存');
+        showToast('AI 设置已保存', 'success');
     } catch (e) {
-        showToast('danger', '保存失败: ' + e.message);
+        showToast('保存失败: ' + e.message, 'danger');
     }
 }
 

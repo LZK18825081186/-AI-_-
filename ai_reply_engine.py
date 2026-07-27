@@ -760,7 +760,52 @@ class AIReplyEngine:
             if hasattr(e, 'request') and hasattr(e.request, 'url'):
                 logger.error(f"请求URL: {e.request.url}")
             return 'default'
-    
+
+    # ==================== 品类识别与风格切换 ====================
+
+    CATEGORY_KEYWORDS = {
+        'clothing': ['衣服', '裙子', '裤子', '外套', '衬衫', 'T恤', '卫衣', '毛衣', '羽绒', '棉服', '大衣', '夹克', '西装', '汉服', 'JK', '洛丽塔', 'cos', 'cosplay', 'cos服', '角色', '动漫', '旗袍', '婚纱', '礼服', '马面'],
+        'electronics': ['手机', '电脑', '笔记本', '平板', 'iPad', '耳机', '音箱', '相机', '键盘', '鼠标', '显示器', '充电器', '数据线', '硬盘', 'U盘', 'switch', 'ps5', 'xbox'],
+        'bag_shoe': ['包', '背包', '鞋', '靴', '运动鞋', '高跟鞋', '球鞋', '拖鞋', '凉鞋', '帆布', '书包', '手提', '双肩', '钱包'],
+        'toy_figure': ['手办', '盲盒', '模型', '乐高', '积木', '公仔', '娃娃', '玩偶', '潮玩', '泡泡马特', '雕像', '军模', '高达', '变形金刚'],
+        'beauty': ['化妆品', '护肤品', '口红', '面膜', '香水', '眼影', '粉底', '精华', '面霜', '防晒', '洁面', '卸妆', '乳液'],
+        'book_game': ['书', '教材', '小说', '漫画', '游戏', '卡带', '碟', '画册', '考研', '考证', '真题', '习题'],
+        'home': ['家具', '家纺', '床品', '窗帘', '灯具', '收纳', '摆件', '装饰', '锅', '碗', '杯', '厨具', '电器', '风扇', '取暖'],
+        'furniture': ['桌', '椅', '沙发', '床', '柜', '书架', '衣架', '茶几', '梳妆台', '鞋柜', '餐桌', '办公桌'],
+    }
+
+    def _detect_product_category(self, item_info: dict) -> str:
+        """根据商品标题/描述自动识别品类"""
+        title = item_info.get('title', '')
+        desc = item_info.get('desc', '')
+        text = f"{title} {desc}"
+        for cat, keywords in self.CATEGORY_KEYWORDS.items():
+            for kw in keywords:
+                if kw in text:
+                    return cat
+        return 'general'
+
+    def _select_prompt(self, custom_prompts: dict, intent: str, item_info: dict) -> str:
+        """按品类+意图两级选择提示词:
+        1. custom_prompts[category][intent] → 品类定制提示词（最高优先）
+        2. custom_prompts[intent]        → 意图通用提示词
+        3. default_prompts[intent]       → 系统默认
+        """
+        category = self._detect_product_category(item_info)
+        # 品类级覆盖
+        cat_prompts = custom_prompts.get(category)
+        if isinstance(cat_prompts, dict):
+            if cat_prompts.get(intent):
+                logger.info(f"使用品类定制提示词: {category}/{intent}")
+                return cat_prompts[intent]
+        # 意图级覆盖
+        if custom_prompts.get(intent):
+            logger.info(f"使用意图定制提示词: {intent}")
+            return custom_prompts[intent]
+        # 兜底：默认提示词
+        logger.info(f"使用系统默认提示词: {intent}")
+        return self.default_prompts[intent]
+
     def _build_image_instruction(self) -> str:
         """构建图片/视频发送指令，追加到 system prompt"""
         items_with_images = []
@@ -1279,9 +1324,9 @@ class AIReplyEngine:
                     self.save_conversation(chat_id, cookie_id, user_id, item_id, "assistant", refuse_reply, intent)
                     return refuse_reply
 
-            # 6. 构建提示词
+            # 6. 构建提示词——支持按商品品类+意图组合选择
             custom_prompts = json.loads(settings['custom_prompts']) if settings['custom_prompts'] else {}
-            system_prompt = custom_prompts.get(intent, self.default_prompts[intent])
+            system_prompt = self._select_prompt(custom_prompts, intent, item_info)
 
             # 注入砍价底线变量（仅 price 意图）
             if intent == 'price':

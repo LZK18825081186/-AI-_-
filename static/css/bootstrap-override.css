@@ -1,0 +1,236 @@
+/* ================================
+   Bootstrap 默认样式深度覆盖
+   强化深空主题一致性
+   ================================ */
+
+/* ── 文字 utility classes ── */
+.text-muted {
+  color: var(--text-muted) !important;
+}
+.text-primary {
+  color: var(--accent) !important;
+}
+.text-secondary {
+  color: var(--text-secondary) !important;
+}
+.text-success {
+  color: var(--success) !important;
+}
+.text-danger {
+  color: var(--danger) !important;
+}
+.text-warning {
+  color: var(--warning) !important;
+}
+.text-info {
+  color: #67e8f9 !important;
+}
+.text-white {
+  color: var(--text-primary) !important;
+}
+.text-white-50 {
+  color: var(--text-secondary) !important;
+  opacity: 1 !important;
+}
+
+/* ── 卡片标题、卡片文本、card 各元素 ── */
+.card-title {
+  margin-bottom: 0.5rem;
+  color: var(--text-primary);
+  font-weight: 700;
+  font-size: 1rem;
+}
+.card-subtitle {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.card-text {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+.card-header {
+  color: var(--text-primary);
+}
+.card-footer {
+  color: var(--text-secondary);
+  background: rgba(15, 21, 53, 0.3);
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* ── Card variants 背景强制 ── */
+.card {
+  background-color: var(--bg-card) !important;
+  color: var(--text-primary) !important;
+  border: 1px solid var(--border-subtle) !important;
+}
+
+/* ── Table 默认文字色 ── */
+.table {
+  --bs-table-color: var(--text-secondary);
+  --bs-table-bg: transparent;
+  --bs-table-border-color: rgba(255, 255, 255, 0.04);
+  --bs-table-striped-color: var(--text-secondary);
+  --bs-table-striped-bg: rgba(255, 255, 255, 0.012);
+  --bs-table-hover-color: var(--text-primary);
+  --bs-table-hover-bg: rgba(0, 212, 255, 0.05);
+  color: var(--text-secondary);
+}
+
+/* Bootstrap striped 兼容 */
+.table-striped > tbody > tr:nth-of-type(odd) > * {
+  --bs-table-bg-type: var(--bs-table-striped-bg);
+  background-color: rgba(255, 255, 255, 0.012) !important;
+  color: var(--text-secondary) !important;
+}
+.table-striped > tbody > tr:nth-of-type(even) > * {
+  background-color: transparent !important;
+  color: var(--text-secondary) !important;
+}
+
+.table-hover > tbody > tr:hover > * {
+  background-color: rgba(0, 212, 255, 0.05) !important;
+  color: var(--text-primary) !important;
+}
+
+/* ── Form 相关 ── */
+.form-label {
+  color: var(--text-secondary);
+}
+.form-text {
+  color: var(--text-muted);
+}
+.form-control,
+.form-select {
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+  border-color: var(--border-subtle-plus);
+}
+.form-control:focus,
+.form-select:focus {
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.08);
+}
+.form-control::placeholder {
+  color: rgba(200, 210, 235, 0.22);
+}
+.form-control:disabled,
+.form-control[readonly] {
+  background-color: rgba(255, 255, 255, 0.03);
+  color: var(--text-muted);
+}
+
+/* ── Dropdown 暗色化 ── */
+.dropdown-menu {
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-glow);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+.dropdown-item {
+  color: var(--text-primary);
+}
+.dropdown-item:hover,
+.dropdown-item:focus {
+  background-color: rgba(0, 212, 255, 0.08);
+  color: var(--accent);
+}
+.dropdown-divider {
+  border-color: var(--border-subtle);
+}
+
+/* ── Modal 强化 ── */
+.modal-content {
+  background-color: var(--bg-surface) !important;
+  color: var(--text-primary) !important;
+  border-color: var(--border-glow) !important;
+}
+
+/* ── Btn close ── */
+.btn-close {
+  filter: invert(0.7);
+  opacity: 0.6;
+}
+.btn-close:hover { opacity: 1; }
+
+/* ── Pagination ── */
+.page-link {
+  background-color: var(--bg-card);
+  border-color: var(--border-subtle);
+  color: var(--text-secondary);
+}
+.page-link:hover {
+  background-color: rgba(0, 212, 255, 0.05);
+  border-color: var(--border-glow);
+  color: var(--text-primary);
+}
+.page-item.active .page-link {
+  background-color: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+/* ── Tabs ── */
+.nav-tabs {
+  border-bottom: 1px solid var(--border-subtle);
+}
+.nav-tabs .nav-link {
+  color: var(--text-secondary);
+  border: 1px solid transparent;
+}
+.nav-tabs .nav-link.active {
+  color: var(--accent);
+  background-color: transparent;
+  border-color: var(--border-glow) var(--border-glow) transparent;
+}
+
+/* ── List group ── */
+.list-group {
+  background-color: transparent;
+}
+.list-group-item {
+  background-color: var(--bg-card);
+  border-color: var(--border-subtle);
+  color: var(--text-primary);
+}
+
+/* ── 链接 ── */
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  color: #67e8f9;
+}
+
+/* ── 滚动条 (Bootstrap 不影响，重复保险) ── */
+* {
+  scrollbar-color: rgba(0, 212, 255, 0.15) transparent;
+}
+
+/* ── Code ── */
+code {
+  color: var(--accent);
+  background: rgba(0, 212, 255, 0.06);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+/* ── Bootstrap icon 字体加载修复兜底 ── */
+@font-face {
+  font-family: "bootstrap-icons";
+  src: url("./fonts/bootstrap-icons.woff2?1bb88866b4085542c8ed5fb61b9393dd") format("woff2"),
+       url("./fonts/bootstrap-icons.woff?1bb88866b4085542c8ed5fb61b9393dd") format("woff");
+  font-display: block;
+}
+.bi::before {
+  font-family: bootstrap-icons !important;
+  font-style: normal;
+  font-weight: normal !important;
+  font-variant: normal;
+  text-transform: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

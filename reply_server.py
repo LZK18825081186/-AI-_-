@@ -33,8 +33,50 @@ KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
 # 简单的用户认证配置
 ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin123"  # 系统初始化时的默认密码
-SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
+# 会话token缓存（启动时从数据库加载，持久化到数据库防止容器重启丢失）
+SESSION_TOKENS: Dict[str, dict] = {}
 TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
+
+def _sync_session_tokens_from_db():
+    """启动时从数据库加载所有会话token到内存"""
+    global SESSION_TOKENS
+    try:
+        from db_manager import db_manager
+        SESSION_TOKENS = db_manager.load_all_session_tokens()
+        # 清理过期token
+        for token, data in list(SESSION_TOKENS.items()):
+            if time.time() - data['timestamp'] > TOKEN_EXPIRE_TIME:
+                del SESSION_TOKENS[token]
+                db_manager.delete_session_token(token)
+        logger.info(f"已加载 {len(SESSION_TOKENS)} 个持久化会话token")
+    except Exception as e:
+        logger.warning(f"加载持久化会话token失败，使用空缓存: {e}")
+
+def _save_session_token(token: str, user_id: int, username: str):
+    """保存token到内存缓存 + 数据库"""
+    SESSION_TOKENS[token] = {
+        'user_id': user_id,
+        'username': username,
+        'timestamp': time.time()
+    }
+    try:
+        from db_manager import db_manager
+        db_manager.save_session_token(token, user_id, username)
+    except Exception as e:
+        logger.warning(f"持久化会话token到数据库失败: {e}")
+
+def _delete_session_token(token: str):
+    """从内存缓存 + 数据库删除token"""
+    if token in SESSION_TOKENS:
+        del SESSION_TOKENS[token]
+    try:
+        from db_manager import db_manager
+        db_manager.delete_session_token(token)
+    except Exception as e:
+        logger.warning(f"从数据库删除会话token失败: {e}")
+
+# 从数据库加载持久化的session token（防止容器重启导致所有用户掉线）
+_sync_session_tokens_from_db()
 
 # HTTP Bearer认证
 security = HTTPBearer(auto_error=False)
@@ -496,13 +538,9 @@ async def login(request: LoginRequest):
         if db_manager.verify_user_password(request.username, request.password):
             user = db_manager.get_user_by_username(request.username)
             if user:
-                # 生成token
+                # 生成token（同时持久化到数据库）
                 token = generate_token()
-                SESSION_TOKENS[token] = {
-                    'user_id': user['id'],
-                    'username': user['username'],
-                    'timestamp': time.time()
-                }
+                _save_session_token(token, user['id'], user['username'])
 
                 # 区分管理员和普通用户的日志
                 if user['username'] == ADMIN_USERNAME:
@@ -531,13 +569,9 @@ async def login(request: LoginRequest):
 
         user = db_manager.get_user_by_email(request.email)
         if user and db_manager.verify_user_password(user['username'], request.password):
-            # 生成token
+            # 生成token（同时持久化到数据库）
             token = generate_token()
-            SESSION_TOKENS[token] = {
-                'user_id': user['id'],
-                'username': user['username'],
-                'timestamp': time.time()
-            }
+            _save_session_token(token, user['id'], user['username'])
 
             logger.info(f"【{user['username']}#{user['id']}】邮箱登录成功")
 
@@ -579,11 +613,7 @@ async def login(request: LoginRequest):
 
         # 生成token
         token = generate_token()
-        SESSION_TOKENS[token] = {
-            'user_id': user['id'],
-            'username': user['username'],
-            'timestamp': time.time()
-        }
+        _save_session_token(token, user['id'], user['username'])
 
         logger.info(f"【{user['username']}#{user['id']}】验证码登录成功")
 
@@ -620,7 +650,7 @@ async def verify(user_info: Optional[Dict[str, Any]] = Depends(verify_token)):
 @app.post('/logout')
 async def logout(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     if credentials and credentials.credentials in SESSION_TOKENS:
-        del SESSION_TOKENS[credentials.credentials]
+        _delete_session_token(credentials.credentials)
     return {"message": "已登出"}
 
 
@@ -3498,9 +3528,33 @@ def batch_delete_items(
 def get_ai_reply_settings(cookie_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定账号的AI回复设置"""
     try:
+        # 如果cookie_id是"default"，返回全局默认设置（不校验cookie权限）
+        if cookie_id == 'default':
+            settings = db_manager.get_ai_reply_settings('default')
+            # 如果没有设置，返回默认值
+            if not settings:
+                return {
+                    'model': 'deepseek-v4-flash',
+                    'base_url': 'https://api.deepseek.com',
+                    'api_key': '',
+                    'system_prompt': ''
+                }
+            # 提取 system_prompt 从 custom_prompts JSON
+            system_prompt = ''
+            if settings.get('custom_prompts'):
+                try:
+                    cp = json.loads(settings['custom_prompts'])
+                    system_prompt = cp.get('general', '')
+                except:
+                    pass
+            return {
+                **settings,
+                'model': settings.get('model_name', ''),
+                'system_prompt': system_prompt
+            }
+
         # 检查cookie是否属于当前用户
         user_id = current_user['user_id']
-        from db_manager import db_manager
         user_cookies = db_manager.get_all_cookies(user_id)
 
         if cookie_id not in user_cookies:
@@ -3573,6 +3627,52 @@ def get_all_ai_reply_settings(current_user: Dict[str, Any] = Depends(get_current
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
 
 
+@app.post("/ai-reply-settings")
+def save_default_ai_reply_settings(settings: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """保存全局默认AI回复设置"""
+    try:
+        from db_manager import db_manager
+        cookie_id = settings.get('cookie_id', 'default')
+        # 只允许保存 'default' 作为全局默认设置
+        if cookie_id != 'default':
+            raise HTTPException(status_code=400, detail="只能通过此接口保存全局默认设置")
+        
+        # 准备兼容的字段映射（数据库列名是 model_name）
+        # 支持两种方式传入回复风格：
+        #   A) system_prompt: 纯文本 → 自动封装为 {"general": text}
+        #   B) custom_prompts: 完整 JSON（品类+意图两级结构）
+        system_prompt = settings.get('system_prompt', '')
+        direct_prompts = settings.get('custom_prompts', '')
+        save_data = {
+            'model_name': settings.get('model_name', settings.get('model', 'deepseek-v4-flash')),
+            'base_url': settings.get('base_url', 'https://api.deepseek.com'),
+            'api_key': settings.get('api_key', ''),
+            'ai_enabled': settings.get('ai_enabled', True),
+        }
+        if direct_prompts:
+            # 直接使用传入的 custom_prompts JSON（品类定制模式）
+            save_data['custom_prompts'] = direct_prompts if isinstance(direct_prompts, str) else json.dumps(direct_prompts, ensure_ascii=False)
+        elif system_prompt:
+            # 将纯文本 system_prompt 封装为简单结构
+            save_data['custom_prompts'] = json.dumps({"general": system_prompt}, ensure_ascii=False)
+        else:
+            save_data['custom_prompts'] = ''
+        
+        # 使用 PUT 相同的核心逻辑但放宽 cookie 权限检查
+        success = db_manager.save_ai_reply_settings(cookie_id, save_data)
+        
+        if success:
+            logger.info(f"全局默认AI回复设置已保存")
+            return {"message": "AI回复设置保存成功", "success": True}
+        else:
+            raise HTTPException(status_code=400, detail="保存失败")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"保存AI回复设置异常: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+
+
 @app.post("/ai-reply-test/{cookie_id}")
 def test_ai_reply(cookie_id: str, test_data: dict, _: None = Depends(require_auth)):
     """测试AI回复功能"""
@@ -3616,6 +3716,93 @@ def test_ai_reply(cookie_id: str, test_data: dict, _: None = Depends(require_aut
     except Exception as e:
         logger.error(f"测试AI回复异常: {e}")
         raise HTTPException(status_code=500, detail=f"服务器错误: {str(e)}")
+
+
+@app.post("/test-ai-reply")
+def test_ai_reply_global(test_data: dict, user: Dict[str, Any] = Depends(get_current_user)):
+    """全局AI回复测试接口 (兼容前端 /test-ai-reply 调用)"""
+    try:
+        cookie_id = test_data.get('cookie_id', 'default')
+        # 如果有指定cookie_id且账号存在，走per-account测试
+        if cookie_id != 'default' and cookie_manager.manager and cookie_id in cookie_manager.manager.cookies:
+            if not ai_reply_engine.is_ai_enabled(cookie_id):
+                raise HTTPException(status_code=400, detail='该账号未启用AI回复')
+            # 使用该账号的配置生成回复
+            test_message = test_data.get('message', '你好')
+            reply = ai_reply_engine.generate_reply(
+                message=test_message,
+                item_info={'title': '测试商品', 'price': 100, 'desc': '测试'},
+                chat_id=f"test_{int(time.time())}",
+                cookie_id=cookie_id,
+                user_id="test_user",
+                item_id="test_item"
+            )
+            if reply:
+                return {"message": "测试成功", "reply": reply}
+            else:
+                raise HTTPException(status_code=400, detail="AI回复生成失败")
+        # 兜底：使用全局默认设置测试
+        settings = db_manager.get_ai_reply_settings('default')
+        if not settings or not settings.get('api_key'):
+            raise HTTPException(status_code=400, detail='请先保存AI回复设置')
+        # 直接调用一次 OpenAI 兼容 API
+        import httpx
+        test_message = test_data.get('message', '你好')
+        api_key = settings.get('api_key', '')
+        base_url = (settings.get('base_url') or 'https://api.deepseek.com').rstrip('/')
+        model = settings.get('model_name') or settings.get('model') or 'deepseek-v4-flash'
+
+        # 读取已保存的回复风格——支持品类+意图两级选择
+        system_content = "你是一个闲鱼卖家，亲切友好地回答买家问题。"
+        if settings.get('custom_prompts'):
+            try:
+                cp = json.loads(settings['custom_prompts'])
+                # 先尝试品类+意图组合（传入 item_info 做品类检测）
+                item_title = test_data.get('item_title', '')
+                item_info = {'title': item_title, 'desc': test_data.get('item_desc', '')}
+                # 使用引擎的品类检测+提示词选择
+                system_content = ai_reply_engine._select_prompt(cp, 'general', item_info)
+            except:
+                pass
+
+        # 修复路径：确保有 /v1（如果用户填了裸域名）
+        if '/v1' not in base_url:
+            base_url = f"{base_url}/v1"
+
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": test_message}
+                    ],
+                    "max_tokens": 200
+                }
+            )
+            if resp.status_code >= 400:
+                detail = ""
+                try:
+                    detail = resp.json().get("error", {}).get("message", "")
+                except:
+                    detail = resp.text[:200]
+                raise HTTPException(status_code=resp.status_code, detail=f"AI接口报错: {detail}")
+            result = resp.json()
+            reply_text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not reply_text:
+                raise HTTPException(status_code=500, detail="AI返回空回复")
+            return {"message": "测试成功", "reply": reply_text}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"全局AI回复测试异常: {e}")
+        raise HTTPException(status_code=500, detail=f"测试失败: {str(e)}")
+
 
 # ==================== 待审核消息API ====================
 

@@ -1,147 +1,106 @@
 /* ================================
-   【日志管理菜单】相关样式
+   深空实验室 — 系统日志
+   模拟终端效果
    ================================ */
+
 .log-container {
   height: 70vh;
   overflow-y: auto;
-  background-color: #1e1e1e;
-  color: #d4d4d4;
-  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-  font-size: 12px;
-  line-height: 1.2;
-  padding: 8px;
-  border-radius: 4px;
+  background: rgba(5, 8, 22, 0.8);
+  color: var(--text-secondary);
+  font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 11.5px;
+  line-height: 1.35;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
 }
 
 .log-entry {
-  margin-bottom: 0px;
   padding: 1px 0;
   word-wrap: break-word;
   white-space: pre-wrap;
-  line-height: 1.2;
+  transition: background 0.15s ease;
 }
 
-.log-entry.DEBUG {
-  color: #9cdcfe;
-}
-
-.log-entry.INFO {
-  color: #4ec9b0;
-}
-
-.log-entry.WARNING {
-  color: #dcdcaa;
-}
-
-.log-entry.ERROR {
-  color: #f48771;
-}
-
+/* 日志级别配色 */
+.log-entry.DEBUG   { color: rgba(200, 210, 235, 0.5); }
+.log-entry.INFO    { color: #4ec9b0; }
+.log-entry.WARNING { color: #dcdcaa; }
+.log-entry.ERROR   { color: #f48771; }
 .log-entry.CRITICAL {
   color: #ff6b6b;
-  font-weight: bold;
+  font-weight: 600;
+  background: rgba(248, 113, 113, 0.06);
 }
 
-.log-timestamp {
-  color: #808080;
-}
-
+.log-timestamp { color: rgba(200, 210, 235, 0.3); }
 .log-level {
-  font-weight: bold;
+  font-weight: 600;
   margin: 0 5px;
 }
+.log-source  { color: #569cd6; }
+.log-message { color: inherit; }
 
-.log-source {
-  color: #569cd6;
-}
-
-.log-message {
-  color: inherit;
-}
-
-.log-container::-webkit-scrollbar {
-  width: 8px;
-}
-
+.log-container::-webkit-scrollbar { width: 8px; }
 .log-container::-webkit-scrollbar-track {
-  background: #2d2d30;
+  background: rgba(0, 212, 255, 0.02);
 }
-
 .log-container::-webkit-scrollbar-thumb {
-  background: #464647;
+  background: rgba(0, 212, 255, 0.1);
   border-radius: 4px;
 }
-
 .log-container::-webkit-scrollbar-thumb:hover {
-  background: #5a5a5c;
+  background: rgba(0, 212, 255, 0.2);
 }
 
-/* 日志过滤标签样式 */
+/* 日志过滤标签 */
 .filter-badge {
   cursor: pointer;
-  transition: all 0.2s;
-  margin-right: 0.5rem;
-  margin-bottom: 0.25rem;
+  transition: all 0.2s ease;
+  margin-right: 0.4rem;
+  margin-bottom: 0.2rem;
 }
-
-.filter-badge:hover {
-  transform: scale(1.05);
-}
-
+.filter-badge:hover { transform: scale(1.05); }
 .filter-badge.active {
-  box-shadow: 0 0 0 2px rgba(255,255,255,0.5);
+  box-shadow: 0 0 0 2px var(--accent), 0 0 8px var(--accent-glow);
 }
 
-/* 自动刷新指示器 */
 .auto-refresh-indicator {
-  animation: pulse 2s infinite;
+  animation: indicatorPulse 2s ease-in-out infinite;
 }
 
-@keyframes pulse {
-  0% { opacity: 1; }
-  50% { opacity: 0.5; }
-  100% { opacity: 1; }
-}
-
-/* 日志行悬停效果 */
 .log-entry:hover {
-  background: rgba(255,255,255,0.05);
+  background: rgba(255, 255, 255, 0.03);
 }
 
-/* 商品搜索相关样式 */
+/* 商品搜索卡片 */
 .item-card {
-  transition: transform 0.2s;
-  border: none;
-  border-radius: 15px;
-  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  transition: all 0.3s var(--ease-material);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
 }
-
 .item-card:hover {
   transform: translateY(-2px);
+  border-color: var(--border-glow);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
 }
-
 .item-image {
   width: 100%;
   height: 200px;
   object-fit: cover;
-  border-radius: 10px;
+  border-radius: 8px;
 }
-
 .price {
-  color: #e74c3c;
-  font-weight: bold;
-  font-size: 1.2em;
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 1.15em;
+  font-family: 'JetBrains Mono', monospace;
 }
-
 .seller-name {
-  color: #6c757d;
-  font-size: 0.9em;
+  color: var(--text-muted);
+  font-size: 0.85em;
 }
-
-.want-count {
-  margin-top: 10px;
-}
-
-.want-count .badge {
-  font-size: 0.8em;
-}
+.want-count { margin-top: 10px; }
+.want-count .badge { font-size: 0.75em; }

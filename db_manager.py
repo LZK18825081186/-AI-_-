@@ -196,6 +196,17 @@ class DBManager:
                 resolved_at TIMESTAMP
             )
             ''')
+            
+            # 创建会话 token 持久化表（防止容器重启导致所有用户掉线）
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS session_tokens (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+            ''')
 
             # 添加砍价底线字段（如果不存在）
             try:
@@ -2406,6 +2417,87 @@ class DBManager:
                 logger.error(f"更新用户密码失败: {e}")
                 self.conn.rollback()
                 return False
+
+    # ════════════════════════════════════
+    # Session Token 持久化
+    # ════════════════════════════════════
+
+    def save_session_token(self, token: str, user_id: int, username: str):
+        """保存会话token到数据库"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                timestamp = time.time()
+                cursor.execute('''
+                INSERT OR REPLACE INTO session_tokens (token, user_id, username, timestamp)
+                VALUES (?, ?, ?, ?)
+                ''', (token, user_id, username, timestamp))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"保存会话token失败: {e}")
+                return False
+
+    def get_session_token(self, token: str) -> Optional[dict]:
+        """获取会话token信息"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT token, user_id, username, timestamp
+                FROM session_tokens WHERE token = ?
+                ''', (token,))
+                row = cursor.fetchone()
+                if row:
+                    return {
+                        'user_id': row[1],
+                        'username': row[2],
+                        'timestamp': row[3]
+                    }
+                return None
+            except Exception as e:
+                logger.error(f"获取会话token失败: {e}")
+                return None
+
+    def delete_session_token(self, token: str):
+        """删除会话token"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('DELETE FROM session_tokens WHERE token = ?', (token,))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"删除会话token失败: {e}")
+                return False
+
+    def delete_expired_session_tokens(self, max_age: float = 86400):
+        """删除过期的会话token（默认24小时）"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cutoff = time.time() - max_age
+                cursor.execute('DELETE FROM session_tokens WHERE timestamp < ?', (cutoff,))
+                self.conn.commit()
+            except Exception as e:
+                logger.error(f"清理过期会话token失败: {e}")
+
+    def load_all_session_tokens(self) -> dict:
+        """从数据库加载所有token到内存（启动时调用）"""
+        tokens = {}
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('SELECT token, user_id, username, timestamp FROM session_tokens')
+                for row in cursor.fetchall():
+                    tokens[row[0]] = {
+                        'user_id': row[1],
+                        'username': row[2],
+                        'timestamp': row[3]
+                    }
+            except Exception as e:
+                logger.error(f"加载会话token失败: {e}")
+        return tokens
 
     def generate_verification_code(self) -> str:
         """生成6位数字验证码"""

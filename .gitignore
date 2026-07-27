@@ -626,3 +626,7 @@ coverage/
 *.json.bak
 *.xml.bak
 *.sql.bak
+
+# 临时脚本（不提交到GitHub）
+save_prompts.py
+system_prompt.txt

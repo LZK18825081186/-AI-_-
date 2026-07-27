@@ -7,117 +7,386 @@
   <link rel="stylesheet" href="/static/lib/bootstrap/bootstrap.min.css">
   <link rel="stylesheet" href="/static/lib/bootstrap-icons/bootstrap-icons.css">
   <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+    * { box-sizing: border-box; }
+
     :root {
-      --primary-color: #0d6efd;
-      --secondary-color: #6c757d;
-      --success-color: #198754;
-      --danger-color: #dc3545;
+      --bg-deepest: #06081a;
+      --bg-surface: #0f1535;
+      --bg-card: rgba(15, 21, 53, 0.55);
+      --accent: #00d4ff;
+      --accent-end: #0078a8;
+      --accent-glow: rgba(0, 212, 255, 0.25);
+      --accent-glow-strong: rgba(0, 212, 255, 0.45);
+      --border-subtle: rgba(0, 212, 255, 0.06);
+      --border-glow: rgba(0, 212, 255, 0.18);
+      --text-primary: #e8ecf8;
+      --text-secondary: rgba(200, 210, 235, 0.55);
+      --text-muted: rgba(200, 210, 235, 0.32);
+      --danger: #f87171;
+      --success: #2dd4bf;
+      --ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
     }
-    
+
     body {
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      margin: 0;
       min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
+      background: var(--bg-deepest);
+      background-image:
+        radial-gradient(ellipse at 30% 40%, rgba(0, 212, 255, 0.06) 0%, transparent 55%),
+        radial-gradient(ellipse at 70% 60%, rgba(99, 102, 241, 0.07) 0%, transparent 50%),
+        linear-gradient(rgba(0, 212, 255, 0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 212, 255, 0.025) 1px, transparent 1px);
+      background-size: 100% 100%, 100% 100%, 48px 48px, 48px 48px;
+      -webkit-font-smoothing: antialiased;
     }
-    
+
+    /* ❖ HUD 角落十字标记 ❖ */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 20px;
+      pointer-events: none;
+      z-index: 0;
+      border-top: 1px solid rgba(0, 212, 255, 0.08);
+      border-bottom: 1px solid rgba(0, 212, 255, 0.08);
+    }
+
+    /* ── 登录卡片 — 玻璃拟态 ── */
     .login-container {
-      background: white;
-      border-radius: 20px;
-      box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-      overflow: hidden;
       width: 100%;
-      max-width: 400px;
+      max-width: 430px;
+      background: var(--bg-card);
+      backdrop-filter: blur(28px) saturate(1.6);
+      -webkit-backdrop-filter: blur(28px) saturate(1.6);
+      border: 1px solid var(--border-subtle);
+      border-radius: 20px;
+      box-shadow:
+        0 32px 100px rgba(0, 0, 0, 0.6),
+        0 0 0 1px rgba(0, 212, 255, 0.04);
+      overflow: hidden;
+      position: relative;
+      z-index: 1;
+      animation: fadeUp 0.5s var(--ease-spring);
     }
-    
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(20px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* 顶部发光条 */
+    .login-container::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 5%; right: 5%;
+      height: 1px;
+      background: linear-gradient(90deg,
+        transparent, rgba(0, 212, 255, 0.2), transparent);
+      z-index: 2;
+    }
+
+    /* ── 头部 — 品牌标识 ── */
     .login-header {
-      background: var(--primary-color);
-      color: white;
-      padding: 30px;
+      padding: 2.25rem 2rem 1.75rem;
       text-align: center;
+      background: linear-gradient(180deg, rgba(0, 212, 255, 0.06), transparent);
+      border-bottom: 1px solid var(--border-subtle);
+      position: relative;
     }
-    
+
+    .login-header::after {
+      content: '';
+      position: absolute;
+      bottom: -1px;
+      left: 20%;
+      right: 20%;
+      height: 1px;
+      background: linear-gradient(90deg,
+        transparent, rgba(0, 212, 255, 0.2), transparent);
+    }
+
+    .login-header .brand-icon {
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-end));
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.4rem;
+      color: #fff;
+      margin-bottom: 0.85rem;
+      box-shadow: 0 0 28px var(--accent-glow-strong), inset 0 1px 0 rgba(255,255,255,0.2);
+      position: relative;
+    }
+
+    .login-header .brand-icon::after {
+      content: '';
+      position: absolute;
+      inset: -3px;
+      border-radius: 17px;
+      border: 1px solid rgba(0, 212, 255, 0.25);
+      animation: glowPulse 3s ease-in-out infinite;
+    }
+
+    @keyframes glowPulse {
+      0%, 100% { opacity: 0.5; }
+      50%      { opacity: 1; }
+    }
+
     .login-header h2 {
       margin: 0;
-      font-weight: 600;
+      font-size: 1.2rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      letter-spacing: -0.02em;
     }
-    
+
     .login-header p {
-      margin: 10px 0 0 0;
-      opacity: 0.9;
+      margin: 0.2rem 0 0;
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      letter-spacing: 0.04em;
     }
-    
+
+    /* ── 登录体 ── */
     .login-body {
-      padding: 40px 30px;
+      padding: 1.75rem 2rem 2.25rem;
     }
-    
-    .form-control {
+
+    /* ── 登录方式 Tab ── */
+    .login-tabs .btn-group {
+      display: flex;
+      gap: 3px;
+      background: rgba(255, 255, 255, 0.02);
       border-radius: 10px;
-      border: 2px solid #e9ecef;
-      padding: 12px 15px;
-      font-size: 16px;
-      transition: all 0.3s ease;
+      padding: 3px;
+      border: 1px solid var(--border-subtle);
     }
-    
-    .form-control:focus {
-      border-color: var(--primary-color);
-      box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25);
-    }
-    
-    .btn-login {
-      background: var(--primary-color);
+
+    .login-tabs .btn {
+      flex: 1;
       border: none;
-      border-radius: 10px;
-      padding: 12px;
-      font-size: 16px;
+      border-radius: 8px !important;
+      padding: 0.5rem 0.55rem;
+      font-size: 0.72rem;
       font-weight: 600;
-      width: 100%;
-      transition: all 0.3s ease;
+      color: var(--text-muted);
+      background: transparent;
+      transition: all 0.2s var(--ease-spring);
+      letter-spacing: 0.02em;
     }
-    
-    .btn-login:hover {
-      background: #0b5ed7;
-      transform: translateY(-2px);
+
+    .login-tabs .btn-check:checked + .btn {
+      background: rgba(0, 212, 255, 0.1);
+      color: var(--accent);
+      box-shadow: 0 0 14px rgba(0, 212, 255, 0.12);
     }
-    
+
+    /* ── 输入框 ── */
     .input-group {
       position: relative;
-      margin-bottom: 20px;
+      margin-bottom: 0.85rem;
     }
-    
+
     .input-group i {
       position: absolute;
-      left: 15px;
+      left: 13px;
       top: 50%;
       transform: translateY(-50%);
-      color: var(--secondary-color);
+      color: var(--text-muted);
       z-index: 10;
+      font-size: 0.88rem;
+      transition: color 0.2s ease;
     }
-    
+
+    .input-group:focus-within i {
+      color: var(--accent);
+    }
+
     .input-group .form-control {
-      padding-left: 45px;
+      padding-left: 38px;
     }
-    
-    .alert {
-      border-radius: 10px;
+
+    .form-control {
+      background: rgba(5, 8, 22, 0.55);
+      border: 1px solid rgba(0, 212, 255, 0.08);
+      border-radius: 8px;
+      padding: 0.6rem 0.85rem;
+      font-size: 0.84rem;
+      font-family: inherit;
+      color: var(--text-primary);
+      width: 100%;
+      transition: all 0.22s var(--ease-spring);
+      box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.3);
+    }
+
+    .form-control:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow:
+        inset 0 1px 3px rgba(0, 0, 0, 0.3),
+        0 0 0 3px rgba(0, 212, 255, 0.08),
+        0 0 16px rgba(0, 212, 255, 0.06);
+    }
+
+    .form-control::placeholder {
+      color: rgba(200, 210, 235, 0.22);
+    }
+
+    /* ── 登录按钮 ── */
+    .btn-login {
+      background: linear-gradient(135deg, var(--accent), var(--accent-end));
       border: none;
+      border-radius: 10px;
+      padding: 0.72rem;
+      font-size: 0.9rem;
+      font-weight: 700;
+      width: 100%;
+      color: #fff;
+      cursor: pointer;
+      transition: all 0.25s var(--ease-spring);
+      box-shadow: 0 4px 22px var(--accent-glow), inset 0 1px 0 rgba(255,255,255,0.15);
+      letter-spacing: 0.02em;
+      position: relative;
+      overflow: hidden;
     }
-    
-    .loading {
-      display: none;
+
+    .btn-login:hover {
+      box-shadow: 0 6px 32px var(--accent-glow-strong), inset 0 1px 0 rgba(255,255,255,0.2);
+      transform: translateY(-1px) scale(1.01);
     }
-    
-    .loading.show {
-      display: inline-block;
+
+    .btn-login:active {
+      transform: scale(0.98);
+    }
+
+    .btn-login::after {
+      content: '';
+      position: absolute;
+      top: 0; left: -100%;
+      width: 100%; height: 100%;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+      transition: left 0.5s;
+    }
+
+    .btn-login:hover::after {
+      left: 100%;
+    }
+
+    /* ── 错误提示 ── */
+    .alert {
+      border-radius: 8px;
+      font-size: 0.8rem;
+      border: 1px solid transparent;
+      padding: 0.6rem 0.85rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .alert-danger {
+      background: rgba(248, 113, 113, 0.08);
+      border-color: rgba(248, 113, 113, 0.15);
+      color: var(--danger);
+    }
+
+    /* ── 表单辅助文字 ── */
+    .form-text, #captchaStatus, #codeStatus {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+    }
+
+    /* ── 默认登录信息 ── */
+    #defaultLoginInfo {
+      background: rgba(15, 21, 53, 0.3) !important;
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      padding: 0.75rem 1rem !important;
+      margin-top: 1.25rem !important;
+    }
+
+    #defaultLoginInfo code {
+      background: rgba(0, 212, 255, 0.06) !important;
+      border: 1px solid rgba(0, 212, 255, 0.1);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    /* ── 注册链接 ── */
+    #registerSection a {
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    #registerSection a:hover {
+      color: #67e8f9;
+    }
+
+    /* ── 验证码 ── */
+    .captcha-container img {
+      border-color: rgba(0, 212, 255, 0.1) !important;
+      border-radius: 8px;
+    }
+
+    .btn-outline-secondary {
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+      background: var(--bg-card);
+      border-radius: 8px;
+      font-size: 0.76rem;
+      font-weight: 500;
+      transition: all 0.2s ease;
+    }
+
+    .btn-outline-secondary:hover {
+      border-color: var(--border-glow);
+      background: rgba(0, 212, 255, 0.06);
+      color: var(--text-primary);
+    }
+
+    .btn-outline-primary {
+      border: 1px solid var(--border-glow);
+      color: var(--accent);
+      background: transparent;
+      border-radius: 8px;
+      font-weight: 500;
+    }
+
+    .btn-outline-primary:hover {
+      background: rgba(0, 212, 255, 0.08);
+      color: #67e8f9;
+      border-color: var(--accent);
+      box-shadow: 0 0 12px var(--accent-glow);
+    }
+
+    /* ── 加载图标 ── */
+    .spinner-border {
+      border-color: rgba(255,255,255,0.2);
+      border-right-color: var(--accent);
+    }
+
+    /* ── 响应式 ── */
+    @media (max-width: 480px) {
+      .login-container { max-width: 95%; border-radius: 16px; }
+      .login-header { padding: 1.5rem 1.25rem 1.25rem; }
+      .login-body { padding: 1.25rem 1.25rem 1.5rem; }
+      .login-tabs .btn { font-size: 0.68rem; padding: 0.45rem 0.4rem; }
     }
   </style>
 </head>
 <body>
   <div class="login-container">
     <div class="login-header">
-      <i class="bi bi-chat-dots-fill fs-1 mb-3"></i>
+      <div class="brand-icon"><i class="bi bi-chat-dots-fill"></i></div>
       <h2>闲鱼自动回复</h2>
       <p>管理系统登录</p>
     </div>
@@ -293,12 +562,16 @@
       const usernameInput = document.getElementById('username');
       const passwordInput = document.getElementById('password');
 
-      usernameInput.style.backgroundColor = '#e3f2fd';
-      passwordInput.style.backgroundColor = '#e3f2fd';
+      usernameInput.style.borderColor = 'var(--accent)';
+      passwordInput.style.borderColor = 'var(--accent)';
+      usernameInput.style.boxShadow = '0 0 12px var(--accent-glow)';
+      passwordInput.style.boxShadow = '0 0 12px var(--accent-glow)';
 
       setTimeout(() => {
-        usernameInput.style.backgroundColor = '';
-        passwordInput.style.backgroundColor = '';
+        usernameInput.style.borderColor = '';
+        passwordInput.style.borderColor = '';
+        usernameInput.style.boxShadow = '';
+        passwordInput.style.boxShadow = '';
       }, 1000);
     }
     
@@ -530,10 +803,10 @@
         const result = await response.json();
 
         if (result.success) {
-          captchaStatus.innerHTML = '<span style="color: green;">✓ 图形验证码验证成功</span>';
+          captchaStatus.innerHTML = '<span style="color: #2dd4bf;">✓ 图形验证码验证成功</span>';
           captchaVerified = true;
         } else {
-          captchaStatus.innerHTML = '<span style="color: red;">✗ 图形验证码错误，请重新输入</span>';
+          captchaStatus.innerHTML = '<span style="color: #f87171;">✗ 图形验证码错误，请重新输入</span>';
           captchaVerified = false;
           refreshCaptcha(); // 自动刷新验证码
         }
@@ -542,7 +815,7 @@
 
       } catch (error) {
         console.error('验证图形验证码失败:', error);
-        captchaStatus.innerHTML = '<span style="color: red;">验证失败，请检查网络连接</span>';
+        captchaStatus.innerHTML = '<span style="color: #f87171;">验证失败，请检查网络连接</span>';
         captchaVerified = false;
         updateSendCodeButton();
       }
