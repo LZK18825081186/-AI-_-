@@ -30,12 +30,12 @@ from loguru import logger
 # 关键字文件路径
 KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
 
-# 简单的用户认证配置
-ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "admin123"  # 系统初始化时的默认密码
+# 管理后台认证配置（优先从环境变量读取）
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 # 会话token缓存（启动时从数据库加载，持久化到数据库防止容器重启丢失）
 SESSION_TOKENS: Dict[str, dict] = {}
-TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
+TOKEN_EXPIRE_TIME = int(os.getenv("TOKEN_EXPIRE_TIME", "86400"))  # 默认24小时
 
 def _sync_session_tokens_from_db():
     """启动时从数据库加载所有会话token到内存"""

@@ -1953,8 +1953,8 @@ class XianyuLive:
         import subprocess
         import uuid
         
-        base_token = "SwZJb2oCPaEkTGs1nKtcLUKTnyd"
-        table_id = "tblizop7uMcAG0TF"
+        base_token = os.environ.get("FEISHU_BASE_TOKEN", "")
+        table_id = os.environ.get("FEISHU_TABLE_ID", "")
         
         # 解析 lark-cli 路径
         lark_cli = os.environ.get('LARK_CLI_PATH', '')

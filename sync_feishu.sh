@@ -5,10 +5,16 @@
 
 set -e
 
-FEISHU_BASE_TOKEN="${FEISHU_BASE_TOKEN:-SwZJb2oCPaEkTGs1nKtcLUKTnyd}"
-FEISHU_TABLE_ID="${FEISHU_TABLE_ID:-tblizop7uMcAG0TF}"
+# 从环境变量读取飞书凭证（通过 .env 或直接 exports）
+FEISHU_BASE_TOKEN="${FEISHU_BASE_TOKEN:-}"
+FEISHU_TABLE_ID="${FEISHU_TABLE_ID:-}"
 DOCKER_CONTAINER="${DOCKER_CONTAINER:-xianyu-auto-reply}"
 KB_FILE="/tmp/knowledge_base_live.txt"
+
+if [ -z "$FEISHU_BASE_TOKEN" ] || [ -z "$FEISHU_TABLE_ID" ]; then
+    echo "❌ 请设置 FEISHU_BASE_TOKEN 和 FEISHU_TABLE_ID 环境变量"
+    exit 1
+fi
 
 echo "=== 飞书库存同步 $(date) ==="
 

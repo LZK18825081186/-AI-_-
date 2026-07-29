@@ -614,12 +614,17 @@ coverage/
 *.dae
 *.3ds
 
-# 字体文件（如果不需要版本控制）
+# 字体文件（前端库字体需保留）
 *.ttf
 *.otf
 *.woff
 *.woff2
 *.eot
+!static/lib/**/*.ttf
+!static/lib/**/*.otf
+!static/lib/**/*.woff
+!static/lib/**/*.woff2
+!static/lib/**/*.eot
 
 # 数据文件（根据需要调整）
 *.csv.bak
