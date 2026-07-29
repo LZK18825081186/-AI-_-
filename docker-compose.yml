@@ -8,6 +8,11 @@ services:
     restart: unless-stopped
     # 使用root用户避免权限问题
     user: "0:0"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "7"
     ports:
       - "${WEB_PORT:-8080}:8080"
     volumes:

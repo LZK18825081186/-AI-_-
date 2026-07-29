@@ -712,14 +712,33 @@ class AIReplyEngine:
         return response.choices[0].message.content.strip()
 
     def is_ai_enabled(self, cookie_id: str) -> bool:
-        """检查指定账号是否启用AI回复"""
+        """检查指定账号是否启用AI回复——优先用账号自身设置，否则继承全局默认"""
         settings = db_manager.get_ai_reply_settings(cookie_id)
-        return settings['ai_enabled']
+        if settings and settings.get('ai_enabled') and settings.get('api_key'):
+            return True
+        # 继承全局默认设置
+        default_settings = db_manager.get_ai_reply_settings('default')
+        return bool(default_settings and default_settings.get('ai_enabled') and default_settings.get('api_key'))
+
+    def _get_merged_settings(self, cookie_id: str) -> dict:
+        """获取合并后的AI设置：账号自身 > 全局默认 > 硬编码兜底"""
+        settings = dict(db_manager.get_ai_reply_settings(cookie_id) or {})
+        defaults = dict(db_manager.get_ai_reply_settings('default') or {})
+        # 全局默认兜底
+        for key in ('model_name', 'api_key', 'base_url', 'custom_prompts', 'ai_enabled'):
+            if not settings.get(key) and defaults.get(key):
+                settings[key] = defaults[key]
+        # 硬编码最底层兜底
+        if not settings.get('model_name'):
+            settings['model_name'] = 'deepseek-v4-flash'
+        if not settings.get('base_url'):
+            settings['base_url'] = 'https://api.deepseek.com'
+        return settings
     
     def detect_intent(self, message: str, cookie_id: str) -> str:
         """检测用户消息意图"""
         try:
-            settings = db_manager.get_ai_reply_settings(cookie_id)
+            settings = self._get_merged_settings(cookie_id)
             if not settings['ai_enabled'] or not settings['api_key']:
                 return 'default'
 
@@ -1279,8 +1298,8 @@ class AIReplyEngine:
             return None
         
         try:
-            # 1. 获取AI回复设置
-            settings = db_manager.get_ai_reply_settings(cookie_id)
+            # 1. 获取AI回复设置（继承全局默认）
+            settings = self._get_merged_settings(cookie_id)
 
             # 2. 检测意图
             intent = self.detect_intent(message, cookie_id)
