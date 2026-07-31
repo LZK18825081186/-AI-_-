@@ -2,6 +2,8 @@ import sqlite3
 import os
 import threading
 import hashlib
+import hmac
+import secrets
 import time
 import json
 import random
@@ -12,10 +14,38 @@ import base64
 from PIL import Image, ImageDraw, ImageFont
 from typing import List, Tuple, Dict, Optional, Any
 from loguru import logger
+from utils.network_security import send_pinned_smtp
 
 class DBManager:
     """SQLite数据库管理，持久化存储Cookie和关键字"""
-    
+
+    PASSWORD_ITERATIONS = 600_000
+
+    @classmethod
+    def _hash_password(cls, password: str) -> str:
+        salt = secrets.token_bytes(16)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, cls.PASSWORD_ITERATIONS
+        )
+        return f"pbkdf2_sha256${cls.PASSWORD_ITERATIONS}${salt.hex()}${digest.hex()}"
+
+    @classmethod
+    def _verify_password_hash(cls, password: str, stored_hash: str) -> tuple[bool, bool]:
+        if stored_hash.startswith("pbkdf2_sha256$"):
+            try:
+                _, rounds, salt_hex, digest_hex = stored_hash.split("$", 3)
+                digest = hashlib.pbkdf2_hmac(
+                    "sha256",
+                    password.encode("utf-8"),
+                    bytes.fromhex(salt_hex),
+                    int(rounds),
+                )
+                return hmac.compare_digest(digest.hex(), digest_hex), False
+            except (ValueError, TypeError):
+                return False, False
+        legacy = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(legacy, stored_hash), True
+
     def __init__(self, db_path: str = None):
         """初始化数据库连接和表结构"""
         # 支持环境变量配置数据库路径
@@ -50,9 +80,9 @@ class DBManager:
         self.conn = None
         self.lock = threading.RLock()  # 使用可重入锁保护数据库操作
 
-        # SQL日志配置 - 默认启用
-        self.sql_log_enabled = True  # 默认启用SQL日志
-        self.sql_log_level = 'INFO'  # 默认使用INFO级别
+        # 生产默认不记录SQL参数，避免交付资料、Cookie和对话内容进入日志。
+        self.sql_log_enabled = False
+        self.sql_log_level = 'DEBUG'
 
         # 允许通过环境变量覆盖默认设置
         if os.getenv('SQL_LOG_ENABLED'):
@@ -252,10 +282,11 @@ class DBManager:
             )
             ''')
 
-            # 创建订单表
+            # 创建订单表 (v1.5: cookie_id + order_id 复合主键)
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS orders (
-                order_id TEXT PRIMARY KEY,
+                cookie_id TEXT NOT NULL,
+                order_id TEXT NOT NULL,
                 item_id TEXT,
                 buyer_id TEXT,
                 spec_name TEXT,
@@ -263,9 +294,45 @@ class DBManager:
                 quantity TEXT,
                 amount TEXT,
                 order_status TEXT DEFAULT 'unknown',
-                cookie_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (cookie_id, order_id),
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+
+            # 批量资料先按订单预留，服务端确认发送后再提交消费。(v1.5: cookie_id复合键)
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS delivery_reservations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cookie_id TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                unit_index INTEGER NOT NULL DEFAULT 0,
+                card_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'reserved'
+                    CHECK (status IN ('reserved', 'committed', 'rolled_back')),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(cookie_id, order_id, unit_index),
+                FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE RESTRICT,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_delivery_reservations_card_status
+            ON delivery_reservations(cookie_id, card_id, status)
+            ''')
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS delivery_dispatches (
+                cookie_id TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'dispatching'
+                    CHECK (status IN ('dispatching', 'confirmed', 'ambiguous', 'manual_required')),
+                last_error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (cookie_id, order_id),
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
             )
             ''')
@@ -454,7 +521,7 @@ class DBManager:
             ('smtp_from', '', '发件人显示名（留空则使用用户名）'),
             ('smtp_use_tls', 'true', '是否启用TLS'),
             ('smtp_use_ssl', 'false', '是否启用SSL'),
-            ('qq_reply_secret_key', 'xianyu_qq_reply_2024', 'QQ回复消息API秘钥')
+            ('qq_reply_secret_key', '', 'QQ回复消息API秘钥（必须显式配置）')
             ''')
 
             # 检查并升级数据库
@@ -467,7 +534,17 @@ class DBManager:
             logger.info("数据库初始化完成")
         except Exception as e:
             logger.error(f"数据库初始化失败: {e}")
-            self.conn.rollback()
+            connection = self.conn
+            self.conn = None
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception as cleanup_error:
+                    logger.warning(f"数据库初始化失败后回滚连接失败: {cleanup_error}")
+                try:
+                    connection.close()
+                except Exception as cleanup_error:
+                    logger.warning(f"数据库初始化失败后关闭连接失败: {cleanup_error}")
             raise
 
     def _migrate_database(self, cursor):
@@ -616,6 +693,20 @@ class DBManager:
                 self.set_system_setting("db_version", "1.4", "数据库版本号")
                 logger.info("数据库升级到版本1.4完成")
 
+            # 升级到版本1.5 - 订单/预留/派发表迁移到账号级复合主键
+            if current_version < "1.5":
+                logger.info("开始升级数据库到版本1.5（账号级订单幂等迁移）...")
+                self._migrate_to_account_scoped_delivery(cursor)
+                self.set_system_setting("db_version", "1.5", "数据库版本号")
+                logger.info("数据库升级到版本1.5完成")
+
+            # 升级到版本1.6 - 区分明确转人工与发送结果不明确
+            if current_version < "1.6":
+                logger.info("开始升级数据库到版本1.6（增加转人工派发状态）...")
+                self._migrate_delivery_dispatches_manual_status(cursor)
+                self.set_system_setting("db_version", "1.6", "数据库版本号")
+                logger.info("数据库升级到版本1.6完成")
+
             # 迁移遗留数据（在所有版本升级完成后执行）
             self.migrate_legacy_data(cursor)
 
@@ -627,21 +718,35 @@ class DBManager:
         """更新admin用户ID"""
         try:
             logger.info("开始更新admin用户ID...")
-            # 创建默认admin用户（只在首次初始化时创建）
-            cursor.execute('SELECT COUNT(*) FROM users WHERE username = ?', ('admin',))
+            # 管理员必须由环境变量显式初始化；生产环境拒绝已知默认密码。
+            admin_username = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
+            admin_password = os.getenv("ADMIN_PASSWORD", "")
+            if not admin_password and os.getenv("DOCKER_ENV", "").lower() == "true":
+                raise RuntimeError("ADMIN_PASSWORD is required in Docker production")
+            if admin_password in {
+                "admin123",
+                "CHANGE_ME",
+                "change_me",
+                "your_secure_password_here",
+                "CHANGE_ME_STRONG_ADMIN_PASSWORD",
+            }:
+                raise RuntimeError("ADMIN_PASSWORD must not use a default or placeholder value")
+            cursor.execute('SELECT COUNT(*) FROM users WHERE username = ?', (admin_username,))
             admin_exists = cursor.fetchone()[0] > 0
 
             if not admin_exists:
-                # 首次创建admin用户，设置默认密码
-                default_password_hash = hashlib.sha256("admin123".encode()).hexdigest()
+                if not admin_password:
+                    # 仅为旧式本地开发保留随机初始密码，绝不输出明文。
+                    admin_password = secrets.token_urlsafe(24)
+                    logger.warning("未配置 ADMIN_PASSWORD，已生成随机本地管理员密码；请通过环境变量重置")
+                password_hash = self._hash_password(admin_password)
                 cursor.execute('''
-                INSERT INTO users (username, email, password_hash) VALUES
-                ('admin', 'admin@localhost', ?)
-                ''', (default_password_hash,))
-                logger.info("创建默认admin用户，密码: admin123")
+                INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)
+                ''', (admin_username, f"{admin_username}@localhost", password_hash))
+                logger.info(f"已从安全配置创建管理员用户: {admin_username}")
 
-            # 获取admin用户ID，用于历史数据绑定
-            self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
+            # 获取管理员用户ID，用于历史数据绑定
+            self._execute_sql(cursor, "SELECT id FROM users WHERE username = ?", (admin_username,))
             admin_user = cursor.fetchone()
             if admin_user:
                 admin_user_id = admin_user[0]
@@ -933,7 +1038,6 @@ class DBManager:
         try:
             logger.info("开始检查和迁移遗留数据...")
 
-            # 检查是否有需要迁移的老表
             legacy_tables = [
                 'old_notification_channels',
                 'legacy_delivery_rules',
@@ -952,6 +1056,222 @@ class DBManager:
         except Exception as e:
             logger.error(f"迁移遗留数据失败: {e}")
             return False
+
+    def _migrate_to_account_scoped_delivery(self, cursor):
+        """v1.5: 将订单/预留/派发迁移为 (cookie_id, order_id) 复合主键。
+
+        孤儿数据（cookie_id 缺失/无效/无归属父订单）移入隔离表，业务代码
+        永不读取；只有明确归属的旧行才进入新业务表。
+        """
+        logger.info("【v1.5】开始账号级订单幂等迁移...")
+
+        isolation_prefix = "_legacy_v15_"
+        old_orders = f"{isolation_prefix}orders"
+        old_reservations = f"{isolation_prefix}reservations"
+        old_dispatches = f"{isolation_prefix}dispatches"
+
+        # 0) 确保隔离表存在
+        cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS {old_orders} (
+            order_id TEXT, item_id TEXT, buyer_id TEXT, spec_name TEXT, spec_value TEXT,
+            quantity TEXT, amount TEXT, order_status TEXT, cookie_id TEXT,
+            created_at TIMESTAMP, updated_at TIMESTAMP
+        )
+        ''')
+        cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS {old_reservations} (
+            id INTEGER, order_id TEXT, unit_index INTEGER, card_id INTEGER,
+            content TEXT, status TEXT, created_at TIMESTAMP, updated_at TIMESTAMP
+        )
+        ''')
+        cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS {old_dispatches} (
+            order_id TEXT, status TEXT, last_error TEXT, created_at TIMESTAMP, updated_at TIMESTAMP
+        )
+        ''')
+
+        # 1) 创建新表
+        cursor.execute('''
+        CREATE TABLE orders_v15 (
+            cookie_id  TEXT NOT NULL,
+            order_id   TEXT NOT NULL,
+            item_id    TEXT,
+            buyer_id   TEXT,
+            spec_name  TEXT,
+            spec_value TEXT,
+            quantity   TEXT,
+            amount     TEXT,
+            order_status TEXT DEFAULT 'unknown',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (cookie_id, order_id),
+            FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+        )
+        ''')
+        cursor.execute('''
+        CREATE TABLE delivery_reservations_v15 (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            cookie_id  TEXT NOT NULL,
+            order_id   TEXT NOT NULL,
+            unit_index INTEGER NOT NULL DEFAULT 0,
+            card_id    INTEGER NOT NULL,
+            content    TEXT NOT NULL,
+            status     TEXT NOT NULL DEFAULT 'reserved'
+                CHECK (status IN ('reserved','committed','rolled_back')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(cookie_id, order_id, unit_index),
+            FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE RESTRICT,
+            FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+        )
+        ''')
+        cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_delivery_reservations_v15_card
+        ON delivery_reservations_v15(cookie_id, card_id, status)
+        ''')
+        cursor.execute('''
+        CREATE TABLE delivery_dispatches_v15 (
+            cookie_id  TEXT NOT NULL,
+            order_id   TEXT NOT NULL,
+            status     TEXT NOT NULL DEFAULT 'dispatching'
+                CHECK (status IN ('dispatching','confirmed','ambiguous','manual_required')),
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (cookie_id, order_id),
+            FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+        )
+        ''')
+
+        # 2) 迁移 orders：cookie_id 存在且在 cookies 表中 → 新表；否则隔离
+        cursor.execute("SELECT order_id,cookie_id FROM orders")
+        order_rows = [(row[0], row[1]) for row in cursor.fetchall()]
+
+        valid_orders = 0
+        orphan_orders = 0
+        for order_id, cookie_id in order_rows:
+            if cookie_id:
+                cursor.execute("SELECT id FROM cookies WHERE id = ?", (cookie_id,))
+                if cursor.fetchone():
+                    cursor.execute('''
+                    INSERT INTO orders_v15
+                        (cookie_id,order_id,item_id,buyer_id,spec_name,spec_value,
+                         quantity,amount,order_status,created_at,updated_at)
+                    SELECT cookie_id,order_id,item_id,buyer_id,spec_name,spec_value,
+                           quantity,amount,order_status,created_at,updated_at
+                    FROM orders WHERE order_id = ? AND cookie_id = ?
+                    ''', (order_id, cookie_id))
+                    valid_orders += 1
+                    continue
+            # 孤儿：移入隔离表
+            cursor.execute(f'''
+            INSERT INTO {old_orders} SELECT * FROM orders WHERE order_id = ?
+            ''', (order_id,))
+            cursor.execute("DELETE FROM orders WHERE order_id = ?", (order_id,))
+            orphan_orders += 1
+
+        # 3) 迁移 delivery_reservations：只迁移 order_id 属于 valid_orders 的行
+        cursor.execute("SELECT DISTINCT order_id,unit_index FROM delivery_reservations")
+        reservation_rows = cursor.fetchall()
+        valid_reservations = 0
+        orphan_reservations = 0
+        for order_id, unit_index in reservation_rows:
+            cursor.execute(
+                "SELECT cookie_id FROM orders_v15 WHERE order_id = ?", (order_id,)
+            )
+            cookie_row = cursor.fetchone()
+            if cookie_row:
+                cookie_id = cookie_row[0]
+                cursor.execute('''
+                INSERT INTO delivery_reservations_v15
+                    (cookie_id,order_id,unit_index,card_id,content,status,created_at,updated_at)
+                SELECT ?,order_id,unit_index,card_id,content,status,created_at,updated_at
+                FROM delivery_reservations WHERE order_id = ? AND unit_index = ?
+                ''', (cookie_id, order_id, unit_index))
+                valid_reservations += 1
+            else:
+                cursor.execute(f'''
+                INSERT INTO {old_reservations}
+                SELECT * FROM delivery_reservations WHERE order_id = ? AND unit_index = ?
+                ''', (order_id, unit_index))
+                orphan_reservations += 1
+
+        # 4) 迁移 delivery_dispatches
+        cursor.execute("SELECT DISTINCT order_id FROM delivery_dispatches")
+        dispatch_rows = cursor.fetchall()
+        valid_dispatches = 0
+        orphan_dispatches = 0
+        for (order_id,) in dispatch_rows:
+            cursor.execute(
+                "SELECT cookie_id FROM orders_v15 WHERE order_id = ?", (order_id,)
+            )
+            cookie_row = cursor.fetchone()
+            if cookie_row:
+                cookie_id = cookie_row[0]
+                cursor.execute('''
+                INSERT INTO delivery_dispatches_v15
+                    (cookie_id,order_id,status,last_error,created_at,updated_at)
+                SELECT ?,order_id,status,last_error,created_at,updated_at
+                FROM delivery_dispatches WHERE order_id = ?
+                ''', (cookie_id, order_id))
+                valid_dispatches += 1
+            else:
+                cursor.execute(f'''
+                INSERT INTO {old_dispatches}
+                SELECT * FROM delivery_dispatches WHERE order_id = ?
+                ''', (order_id,))
+                orphan_dispatches += 1
+
+        logger.info(
+            f"【v1.5】迁移统计 — 订单: {valid_orders} 有效/{orphan_orders} 孤儿, "
+            f"预留: {valid_reservations} 有效/{orphan_reservations} 孤儿, "
+            f"派发: {valid_dispatches} 有效/{orphan_dispatches} 孤儿"
+        )
+
+        # 5) 旧表改名为隔离表（残留行，若上面漏删）然后删除；新表改名
+        for old, new in [
+            ("orders", "orders"),
+            ("delivery_reservations", "delivery_reservations"),
+            ("delivery_dispatches", "delivery_dispatches"),
+        ]:
+            cursor.execute(f"DROP TABLE IF EXISTS {old}")
+            cursor.execute(f"ALTER TABLE {new}_v15 RENAME TO {new}")
+
+        logger.info("【v1.5】账号级订单幂等迁移完成")
+        return True
+
+    def _migrate_delivery_dispatches_manual_status(self, cursor):
+        """v1.6: 允许持久化明确未发送并转人工的派发结果。"""
+        cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='delivery_dispatches'"
+        )
+        table_row = cursor.fetchone()
+        if table_row and "manual_required" in (table_row[0] or ""):
+            return True
+
+        cursor.execute("DROP TABLE IF EXISTS delivery_dispatches_v16")
+        cursor.execute('''
+        CREATE TABLE delivery_dispatches_v16 (
+            cookie_id TEXT NOT NULL,
+            order_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'dispatching'
+                CHECK (status IN ('dispatching', 'confirmed', 'ambiguous', 'manual_required')),
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (cookie_id, order_id),
+            FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+        )
+        ''')
+        cursor.execute('''
+        INSERT INTO delivery_dispatches_v16
+            (cookie_id, order_id, status, last_error, created_at, updated_at)
+        SELECT cookie_id, order_id, status, last_error, created_at, updated_at
+        FROM delivery_dispatches
+        ''')
+        cursor.execute("DROP TABLE delivery_dispatches")
+        cursor.execute("ALTER TABLE delivery_dispatches_v16 RENAME TO delivery_dispatches")
+        return True
 
     def _migrate_table_data(self, cursor, table_name: str):
         """迁移指定表的数据"""
@@ -1065,11 +1385,45 @@ class DBManager:
                 pass
             raise
 
+    def create_online_backup(self, destination: str) -> str:
+        """使用 SQLite 在线备份 API 创建一致性快照并验证完整性。"""
+        destination = os.path.abspath(destination)
+        os.makedirs(os.path.dirname(destination) or '.', exist_ok=True)
+        with self.lock:
+            target = sqlite3.connect(destination)
+            try:
+                self.get_connection().backup(target)
+                result = target.execute('PRAGMA integrity_check').fetchone()
+                if not result or result[0] != 'ok':
+                    raise RuntimeError('数据库备份完整性检查失败')
+            finally:
+                target.close()
+        return destination
+
+    def stage_online_restore(self, source: str, destination: str) -> str:
+        """使用 SQLite 在线备份 API 将上传库复制到已校验的恢复暂存库。"""
+        source = os.path.abspath(source)
+        destination = os.path.abspath(destination)
+        os.makedirs(os.path.dirname(destination) or '.', exist_ok=True)
+        with self.lock:
+            source_conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+            target = sqlite3.connect(destination)
+            try:
+                source_conn.backup(target)
+                result = target.execute('PRAGMA integrity_check').fetchone()
+                if not result or result[0] != 'ok':
+                    raise RuntimeError('数据库恢复完整性检查失败')
+            finally:
+                target.close()
+                source_conn.close()
+        return destination
+
     def close(self):
         """关闭数据库连接"""
-        if self.conn:
-            self.conn.close()
-            self.conn = None
+        with self.lock:
+            if self.conn:
+                self.conn.close()
+                self.conn = None
     
     def get_connection(self):
         """获取数据库连接，如果已关闭则重新连接"""
@@ -1082,22 +1436,30 @@ class DBManager:
         if not self.sql_log_enabled:
             return
 
-        # 格式化参数
-        params_str = ""
-        if params:
-            if isinstance(params, (list, tuple)):
-                if len(params) > 0:
-                    # 限制参数长度，避免日志过长
-                    formatted_params = []
-                    for param in params:
-                        if isinstance(param, str) and len(param) > 100:
-                            formatted_params.append(f"{param[:100]}...")
-                        else:
-                            formatted_params.append(repr(param))
-                    params_str = f" | 参数: [{', '.join(formatted_params)}]"
-
         # 格式化SQL（移除多余空白）
         formatted_sql = ' '.join(sql.split())
+        sensitive_sql = any(
+            marker in formatted_sql.lower()
+            for marker in (
+                "cookie", " value", "token", "password", "secret", "api_key",
+                "verification", "captcha", " code", "session_tokens",
+                "data_content", "delivery_reservations", "content", "conversation",
+            )
+        )
+
+        # 格式化参数；涉及凭据或令牌的 SQL 不记录任何实值。
+        params_str = ""
+        if params and isinstance(params, (list, tuple)):
+            if sensitive_sql:
+                params_str = f" | 参数: [{', '.join('[REDACTED]' for _ in params)}]"
+            elif len(params) > 0:
+                formatted_params = []
+                for param in params:
+                    if isinstance(param, str) and len(param) > 100:
+                        formatted_params.append(f"{param[:100]}...")
+                    else:
+                        formatted_params.append(repr(param))
+                params_str = f" | 参数: [{', '.join(formatted_params)}]"
 
         # 根据配置的日志级别输出
         log_message = f"🗄️ SQL {operation}: {formatted_sql}{params_str}"
@@ -2169,90 +2531,155 @@ class DBManager:
                 raise
 
     def import_backup(self, backup_data: Dict[str, any], user_id: int = None) -> bool:
-        """导入系统备份数据（支持用户隔离）"""
+        """导入备份；用户级导入严格限制为当前用户可拥有的数据。"""
         with self.lock:
             try:
-                # 验证备份数据格式
-                if not isinstance(backup_data, dict) or 'data' not in backup_data:
+                if not isinstance(backup_data, dict) or not isinstance(backup_data.get('data'), dict):
                     raise ValueError("备份数据格式无效")
 
-                # 开始事务
+                data = backup_data['data']
+                user_tables = {
+                    'cookies', 'keywords', 'cookie_status', 'default_replies',
+                    'message_notifications', 'item_info', 'ai_reply_settings',
+                    'ai_conversations'
+                }
+                system_tables = user_tables | {
+                    'cards', 'delivery_rules', 'notification_channels',
+                    'system_settings', 'ai_item_cache'
+                }
+                allowed_tables = user_tables if user_id is not None else system_tables
+                unexpected_tables = set(data) - allowed_tables
+                if unexpected_tables:
+                    raise ValueError(f"备份包含不允许导入的表: {sorted(unexpected_tables)}")
+
+                total_rows = 0
+                normalized_tables = {}
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "BEGIN TRANSACTION")
+                for table_name, table_data in data.items():
+                    if not isinstance(table_data, dict):
+                        raise ValueError(f"表 {table_name} 的备份格式无效")
+                    columns = table_data.get('columns')
+                    rows = table_data.get('rows')
+                    if not isinstance(columns, list) or not isinstance(rows, list):
+                        raise ValueError(f"表 {table_name} 的列或记录格式无效")
+                    if not columns or len(columns) != len(set(columns)):
+                        raise ValueError(f"表 {table_name} 的列定义无效")
+                    if len(rows) > 10000:
+                        raise ValueError(f"表 {table_name} 的记录数超过上限")
+                    total_rows += len(rows)
+                    if total_rows > 50000:
+                        raise ValueError("备份总记录数超过上限")
+
+                    cursor.execute(f'PRAGMA table_info("{table_name}")')
+                    schema_columns = {row[1]: row[1] for row in cursor.fetchall()}
+                    try:
+                        trusted_columns = [schema_columns[column] for column in columns]
+                    except (KeyError, TypeError):
+                        raise ValueError(f"表 {table_name} 包含无效列")
+
+                    normalized_rows = []
+                    for row in rows:
+                        if not isinstance(row, (list, tuple)) or len(row) != len(columns):
+                            raise ValueError(f"表 {table_name} 包含无效记录")
+                        normalized_rows.append(list(row))
+                    normalized_tables[table_name] = (trusted_columns, normalized_rows)
 
                 if user_id is not None:
-                    # 用户级导入：只清空该用户的数据
-                    # 获取用户的cookie_id列表
+                    cookie_columns, cookie_rows = normalized_tables.get('cookies', ([], []))
+                    if cookie_rows and ('id' not in cookie_columns or 'user_id' not in cookie_columns):
+                        raise ValueError("用户备份的 cookies 表缺少必要列")
+                    imported_cookie_ids = set()
+                    if cookie_rows:
+                        id_index = cookie_columns.index('id')
+                        owner_index = cookie_columns.index('user_id')
+                        for row in cookie_rows:
+                            cookie_id = str(row[id_index] or '').strip()
+                            if not cookie_id or len(cookie_id) > 255:
+                                raise ValueError("备份包含无效 Cookie ID")
+                            row[owner_index] = user_id
+                            imported_cookie_ids.add(cookie_id)
+
+                    for table_name, (columns, rows) in normalized_tables.items():
+                        if table_name == 'cookies' or not rows:
+                            continue
+                        if 'cookie_id' not in columns:
+                            raise ValueError(f"用户备份表 {table_name} 缺少 cookie_id")
+                        cookie_index = columns.index('cookie_id')
+                        if any(str(row[cookie_index]) not in imported_cookie_ids for row in rows):
+                            raise ValueError(f"表 {table_name} 引用了当前备份之外的 Cookie")
+
+                    if normalized_tables.get('message_notifications', ([], []))[1]:
+                        columns, rows = normalized_tables['message_notifications']
+                        if 'channel_id' not in columns:
+                            raise ValueError("消息通知备份缺少 channel_id")
+                        channel_index = columns.index('channel_id')
+                        channel_ids = {row[channel_index] for row in rows}
+                        if channel_ids:
+                            placeholders = ','.join('?' for _ in channel_ids)
+                            cursor.execute(
+                                f"SELECT id FROM notification_channels WHERE user_id = ? AND id IN ({placeholders})",
+                                (user_id, *channel_ids)
+                            )
+                            owned_channel_ids = {row[0] for row in cursor.fetchall()}
+                            if owned_channel_ids != channel_ids:
+                                raise ValueError("消息通知引用了不属于当前用户的渠道")
+
+                self._execute_sql(cursor, "BEGIN TRANSACTION")
+                if user_id is not None:
                     self._execute_sql(cursor, "SELECT id FROM cookies WHERE user_id = ?", (user_id,))
                     user_cookie_ids = [row[0] for row in cursor.fetchall()]
-
                     if user_cookie_ids:
-                        placeholders = ','.join(['?' for _ in user_cookie_ids])
-
-                        # 删除用户相关数据
-                        related_tables = ['message_notifications', 'default_replies', 'item_info',
-                                        'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings']
-
-                        for table in related_tables:
-                            cursor.execute(f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
-
-                        # 删除用户的cookies
+                        placeholders = ','.join('?' for _ in user_cookie_ids)
+                        for table in [
+                            'message_notifications', 'default_replies', 'item_info',
+                            'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings'
+                        ]:
+                            cursor.execute(
+                                f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})",
+                                user_cookie_ids
+                            )
                         self._execute_sql(cursor, "DELETE FROM cookies WHERE user_id = ?", (user_id,))
                 else:
-                    # 系统级导入：清空所有数据（除了用户和管理员密码）
-                    tables = [
+                    for table in [
                         'message_notifications', 'notification_channels', 'default_replies',
                         'delivery_rules', 'cards', 'item_info', 'cookie_status', 'keywords',
                         'ai_conversations', 'ai_reply_settings', 'ai_item_cache', 'cookies'
-                    ]
-
-                    for table in tables:
+                    ]:
                         cursor.execute(f"DELETE FROM {table}")
+                    self._execute_sql(
+                        cursor,
+                        "DELETE FROM system_settings WHERE key != 'admin_password_hash'"
+                    )
 
-                    # 清空系统设置（保留管理员密码）
-                    self._execute_sql(cursor, "DELETE FROM system_settings WHERE key != 'admin_password_hash'")
-
-                # 导入数据
-                data = backup_data['data']
-                for table_name, table_data in data.items():
-                    if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
-                                        'delivery_rules', 'default_replies', 'notification_channels',
-                                        'message_notifications', 'system_settings', 'item_info',
-                                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache']:
+                import_order = [
+                    'cookies', 'notification_channels', 'cards', 'keywords',
+                    'cookie_status', 'default_replies', 'item_info', 'ai_reply_settings',
+                    'ai_conversations', 'message_notifications', 'delivery_rules',
+                    'ai_item_cache', 'system_settings'
+                ]
+                for table_name in import_order:
+                    if table_name not in normalized_tables:
                         continue
-
-                    columns = table_data['columns']
-                    rows = table_data['rows']
-
+                    columns, rows = normalized_tables[table_name]
                     if not rows:
                         continue
-
-                    # 如果是用户级导入，需要确保cookies表的user_id正确
-                    if user_id is not None and table_name == 'cookies':
-                        # 更新所有导入的cookies的user_id
-                        updated_rows = []
-                        for row in rows:
-                            row_dict = dict(zip(columns, row))
-                            row_dict['user_id'] = user_id
-                            updated_rows.append([row_dict[col] for col in columns])
-                        rows = updated_rows
-
-                    # 构建插入语句
-                    placeholders = ','.join(['?' for _ in columns])
-
+                    quoted_columns = ','.join(f'"{column}"' for column in columns)
+                    placeholders = ','.join('?' for _ in columns)
+                    sql = f'INSERT INTO "{table_name}" ({quoted_columns}) VALUES ({placeholders})'
                     if table_name == 'system_settings':
-                        # 系统设置需要特殊处理，避免覆盖管理员密码
-                        for row in rows:
-                            if len(row) >= 1 and row[0] != 'admin_password_hash':
-                                cursor.execute(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", row)
+                        key_index = columns.index('key') if 'key' in columns else None
+                        safe_rows = [
+                            row for row in rows
+                            if key_index is not None and row[key_index] != 'admin_password_hash'
+                        ]
+                        if safe_rows:
+                            cursor.executemany(sql, safe_rows)
                     else:
-                        cursor.executemany(f"INSERT INTO {table_name} ({','.join(columns)}) VALUES ({placeholders})", rows)
+                        cursor.executemany(sql, rows)
 
-                # 提交事务
                 self.conn.commit()
-                logger.info("导入备份成功")
+                logger.info(f"导入备份成功，用户ID: {user_id}")
                 return True
-
             except Exception as e:
                 logger.error(f"导入备份失败: {e}")
                 self.conn.rollback()
@@ -2313,7 +2740,7 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                password_hash = hashlib.sha256(password.encode()).hexdigest()
+                password_hash = self._hash_password(password)
 
                 cursor.execute('''
                 INSERT INTO users (username, email, password_hash)
@@ -2390,15 +2817,17 @@ class DBManager:
         if not user:
             return False
 
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
-        return user['password_hash'] == password_hash and user['is_active']
+        valid, needs_upgrade = self._verify_password_hash(password, user['password_hash'])
+        if valid and needs_upgrade:
+            self.update_user_password(username, password)
+        return valid and user['is_active']
 
     def update_user_password(self, username: str, new_password: str) -> bool:
         """更新用户密码"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                password_hash = hashlib.sha256(new_password.encode()).hexdigest()
+                password_hash = self._hash_password(new_password)
 
                 cursor.execute('''
                 UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP
@@ -2469,6 +2898,30 @@ class DBManager:
                 return True
             except Exception as e:
                 logger.error(f"删除会话token失败: {e}")
+                return False
+
+    def delete_session_tokens_by_user(self, user_id: int) -> bool:
+        """撤销指定用户的全部持久化会话。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('DELETE FROM session_tokens WHERE user_id = ?', (user_id,))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"撤销用户会话token失败: {e}")
+                return False
+
+    def delete_all_session_tokens(self) -> bool:
+        """撤销全部持久化会话，供数据库恢复等安全边界使用。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('DELETE FROM session_tokens')
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"撤销全部会话token失败: {e}")
                 return False
 
     def delete_expired_session_tokens(self, max_age: float = 86400):
@@ -2729,9 +3182,8 @@ class DBManager:
     async def _send_email_via_smtp(self, email: str, subject: str, text_content: str,
                                  smtp_server: str, smtp_port: int, smtp_user: str,
                                  smtp_password: str, smtp_from: str, smtp_use_tls: bool, smtp_use_ssl: bool) -> bool:
-        """使用SMTP方式发送邮件"""
+        """使用 pinned SMTP 发送邮件，阻止 DNS rebinding"""
         try:
-            import smtplib
             from email.mime.text import MIMEText
             from email.mime.multipart import MIMEMultipart
 
@@ -2739,37 +3191,30 @@ class DBManager:
             msg['Subject'] = subject
             msg['From'] = smtp_from
             msg['To'] = email
-
             msg.attach(MIMEText(text_content, 'plain', 'utf-8'))
 
-            if smtp_use_ssl:
-                server = smtplib.SMTP_SSL(smtp_server, smtp_port)
-            else:
-                server = smtplib.SMTP(smtp_server, smtp_port)
-
-            server.ehlo()
-            if smtp_use_tls and not smtp_use_ssl:
-                server.starttls()
-                server.ehlo()
-
-            server.login(smtp_user, smtp_password)
-            server.sendmail(smtp_user, [email], msg.as_string())
-            server.quit()
+            send_pinned_smtp(
+                hostname=smtp_server,
+                port=smtp_port,
+                use_ssl=smtp_use_ssl,
+                use_starttls=smtp_use_tls,
+                username=smtp_user,
+                password=smtp_password,
+                from_addr=smtp_user,
+                to_addrs=[email],
+                message_bytes=msg.as_bytes(),
+            )
 
             logger.info(f"验证码邮件发送成功(SMTP): {email}")
             return True
         except Exception as e:
             logger.error(f"SMTP发送验证码邮件失败: {e}")
-            # SMTP发送失败，尝试使用API方式
             logger.info(f"SMTP发送失败，尝试使用API方式发送: {email}")
             return await self._send_email_via_api(email, subject, text_content)
 
     async def _send_email_via_api(self, email: str, subject: str, text_content: str) -> bool:
-        """使用API方式发送邮件"""
+        """使用固定 API 发送邮件（非租户可控，但仍用 secure 通道）"""
         try:
-            import aiohttp
-
-            # 使用GET请求发送邮件
             api_url = "https://dy.zhinianboke.com/api/emailSend"
             params = {
                 'subject': subject,
@@ -2777,24 +3222,17 @@ class DBManager:
                 'sendHtml': text_content
             }
 
-            async with aiohttp.ClientSession() as session:
-                try:
-                    logger.info(f"使用API发送验证码邮件: {email}")
-                    async with session.get(api_url, params=params, timeout=15) as response:
-                        response_text = await response.text()
-                        logger.info(f"邮件API响应: {response.status}")
-
-                        if response.status == 200:
-                            logger.info(f"验证码邮件发送成功(API): {email}")
-                            return True
-                        else:
-                            logger.error(f"API发送验证码邮件失败: {email}, 状态码: {response.status}, 响应: {response_text[:200]}")
-                            return False
-                except Exception as e:
-                    logger.error(f"API邮件发送异常: {email}, 错误: {e}")
+            from utils.network_security import secure_request
+            async with secure_request('GET', api_url, params=params, timeout=15) as response:
+                logger.info(f"邮件API响应状态: {response.status}")
+                if response.status == 200:
+                    logger.info(f"验证码邮件发送成功(API): {email}")
+                    return True
+                else:
+                    logger.error(f"API发送验证码邮件失败: {email}, 状态码: {response.status}")
                     return False
         except Exception as e:
-            logger.error(f"API邮件发送方法异常: {e}")
+            logger.error(f"API邮件发送异常: {email}, 错误: {e}")
             return False
 
     # ==================== 卡券管理方法 ====================
@@ -3151,8 +3589,8 @@ class DBManager:
                 logger.error(f"获取发货规则列表失败: {e}")
                 return []
 
-    def get_delivery_rules_by_keyword(self, keyword: str):
-        """根据关键字获取匹配的发货规则"""
+    def get_delivery_rules_by_keyword(self, keyword: str, user_id: int):
+        """根据关键字获取当前用户的匹配发货规则。"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
@@ -3166,6 +3604,7 @@ class DBManager:
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
                 WHERE dr.enabled = 1 AND c.enabled = 1
+                AND dr.user_id = ? AND c.user_id = ?
                 AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                 ORDER BY
                     CASE
@@ -3173,7 +3612,7 @@ class DBManager:
                         ELSE LENGTH(dr.keyword) / 2
                     END DESC,
                     dr.id ASC
-                ''', (keyword, keyword, keyword))
+                ''', (user_id, user_id, keyword, keyword, keyword))
 
                 rules = []
                 for row in cursor.fetchall():
@@ -3324,8 +3763,10 @@ class DBManager:
             except Exception as e:
                 logger.error(f"更新发货次数失败: {e}")
 
-    def get_delivery_rules_by_keyword_and_spec(self, keyword: str, spec_name: str = None, spec_value: str = None):
-        """根据关键字和规格信息获取匹配的发货规则（支持多规格）"""
+    def get_delivery_rules_by_keyword_and_spec(
+        self, keyword: str, user_id: int, spec_name: str = None, spec_value: str = None
+    ):
+        """根据关键字和规格获取当前用户的匹配发货规则。"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
@@ -3342,6 +3783,7 @@ class DBManager:
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.enabled = 1 AND c.enabled = 1
+                    AND dr.user_id = ? AND c.user_id = ?
                     AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                     AND c.is_multi_spec = 1 AND c.spec_name = ? AND c.spec_value = ?
                     ORDER BY
@@ -3350,7 +3792,9 @@ class DBManager:
                             ELSE LENGTH(dr.keyword) / 2
                         END DESC,
                         dr.delivery_times ASC
-                    ''', (keyword, keyword, spec_name, spec_value, keyword))
+                    ''', (
+                        user_id, user_id, keyword, keyword, spec_name, spec_value, keyword
+                    ))
 
                     rules = []
                     for row in cursor.fetchall():
@@ -3400,6 +3844,7 @@ class DBManager:
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
                 WHERE dr.enabled = 1 AND c.enabled = 1
+                AND dr.user_id = ? AND c.user_id = ?
                 AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                 AND (c.is_multi_spec = 0 OR c.is_multi_spec IS NULL)
                 ORDER BY
@@ -3408,7 +3853,7 @@ class DBManager:
                         ELSE LENGTH(dr.keyword) / 2
                     END DESC,
                     dr.delivery_times ASC
-                ''', (keyword, keyword, keyword))
+                ''', (user_id, user_id, keyword, keyword, keyword))
 
                 rules = []
                 for row in cursor.fetchall():
@@ -3455,18 +3900,30 @@ class DBManager:
                 return []
 
     def delete_card(self, card_id: int):
-        """删除卡券"""
+        """在同一事务中删除卡券及其交付预留记录。"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                self._execute_sql(cursor, "DELETE FROM cards WHERE id = ?", (card_id,))
+                cursor.execute("BEGIN IMMEDIATE")
+                cursor.execute('''
+                    DELETE FROM delivery_dispatches
+                    WHERE (cookie_id, order_id) IN (
+                        SELECT cookie_id, order_id
+                        FROM delivery_reservations
+                        WHERE card_id = ?
+                    )
+                ''', (card_id,))
+                cursor.execute(
+                    "DELETE FROM delivery_reservations WHERE card_id = ?", (card_id,)
+                )
+                cursor.execute("DELETE FROM cards WHERE id = ?", (card_id,))
 
                 if cursor.rowcount > 0:
                     self.conn.commit()
                     logger.info(f"删除卡券成功: ID {card_id}")
                     return True
-                else:
-                    return False  # 没有找到对应的记录
+                self.conn.rollback()
+                return False
 
             except Exception as e:
                 logger.error(f"删除卡券失败: {e}")
@@ -3495,49 +3952,238 @@ class DBManager:
                 self.conn.rollback()
                 raise
 
-    def consume_batch_data(self, card_id: int):
-        """消费批量数据的第一条记录（线程安全）"""
+    def reserve_batch_data(self, card_id: int, order_id: str, unit_index: int = 0, cookie_id: str = ""):
+        """为订单原子预留一条批量资料；同一订单单元重复调用返回原预留。(v1.5: account-scoped)"""
+        if not order_id or not cookie_id:
+            raise ValueError("预留批量资料必须提供订单ID和账号ID")
+
         with self.lock:
+            cursor = self.conn.cursor()
             try:
-                cursor = self.conn.cursor()
+                cursor.execute("BEGIN IMMEDIATE")
+                cursor.execute('''
+                SELECT card_id, content, status
+                FROM delivery_reservations
+                WHERE cookie_id = ? AND order_id = ? AND unit_index = ?
+                ''', (cookie_id, order_id, unit_index))
+                existing = cursor.fetchone()
+                if existing:
+                    existing_card_id, content, status = existing
+                    if existing_card_id != card_id:
+                        raise ValueError("同一订单单元不能改用其他卡券")
+                    if status in ('reserved', 'committed'):
+                        self.conn.commit()
+                        return content
+                    # 回滚记录的内容已归还卡券；重新预留时必须再次从库存中移除同一条。
+                    cursor.execute("SELECT data_content FROM cards WHERE id = ?", (card_id,))
+                    card = cursor.fetchone()
+                    lines = [line.strip() for line in (card[0] if card else '').split('\n') if line.strip()]
+                    try:
+                        lines.remove(content)
+                    except ValueError as exc:
+                        raise RuntimeError("回滚资料已不在库存中，拒绝重复预留") from exc
+                    cursor.execute('''
+                    UPDATE cards SET data_content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+                    ''', ('\n'.join(lines), card_id))
+                    cursor.execute('''
+                    UPDATE delivery_reservations
+                    SET status = 'reserved', updated_at = CURRENT_TIMESTAMP
+                    WHERE cookie_id = ? AND order_id = ? AND unit_index = ?
+                    ''', (cookie_id, order_id, unit_index))
+                    self.conn.commit()
+                    return content
 
-                # 获取卡券的批量数据
-                self._execute_sql(cursor, "SELECT data_content FROM cards WHERE id = ? AND type = 'data'", (card_id,))
+                cursor.execute(
+                    "SELECT data_content FROM cards WHERE id = ? AND type = 'data' AND enabled = 1",
+                    (card_id,),
+                )
                 result = cursor.fetchone()
-
                 if not result or not result[0]:
-                    logger.warning(f"卡券 {card_id} 没有批量数据")
+                    self.conn.rollback()
+                    logger.warning(f"卡券 {card_id} 没有可预留的批量资料")
                     return None
 
-                data_content = result[0]
-                lines = [line.strip() for line in data_content.split('\n') if line.strip()]
-
+                lines = [line.strip() for line in result[0].split('\n') if line.strip()]
                 if not lines:
-                    logger.warning(f"卡券 {card_id} 批量数据为空")
+                    self.conn.rollback()
                     return None
 
-                # 获取第一条数据
-                first_line = lines[0]
-
-                # 移除第一条数据，更新数据库
-                remaining_lines = lines[1:]
-                new_data_content = '\n'.join(remaining_lines)
-
+                content = lines[0]
                 cursor.execute('''
                 UPDATE cards
                 SET data_content = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
-                ''', (new_data_content, card_id))
-
+                ''', ('\n'.join(lines[1:]), card_id))
+                cursor.execute('''
+                INSERT INTO delivery_reservations
+                    (cookie_id, order_id, unit_index, card_id, content, status)
+                VALUES (?, ?, ?, ?, ?, 'reserved')
+                ''', (cookie_id, order_id, unit_index, card_id, content))
                 self.conn.commit()
-
-                logger.info(f"消费批量数据成功: 卡券ID={card_id}, 剩余={len(remaining_lines)}条")
-                return first_line
-
+                logger.info(
+                    f"批量资料预留成功: 订单={order_id}, 单元={unit_index}, "
+                    f"卡券={card_id}, 可用剩余={len(lines) - 1}条"
+                )
+                return content
             except Exception as e:
-                logger.error(f"消费批量数据失败: {e}")
                 self.conn.rollback()
+                logger.error(f"预留批量资料失败: {e}")
+                raise
+
+    def set_delivery_dispatch_status(
+        self, order_id: str, status: str, last_error: str = None, cookie_id: str = ""
+    ) -> bool:
+        """持久化消息派发边界，供崩溃恢复时禁止重复发送。(v1.5: account-scoped)"""
+        if status not in {"dispatching", "confirmed", "ambiguous", "manual_required"}:
+            raise ValueError("无效的交付派发状态")
+        if not cookie_id:
+            raise ValueError("set_delivery_dispatch_status 必须提供 cookie_id")
+        with self.lock:
+            try:
+                self.conn.execute('''
+                    INSERT INTO delivery_dispatches (cookie_id, order_id, status, last_error)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(cookie_id, order_id) DO UPDATE SET
+                        status = excluded.status,
+                        last_error = excluded.last_error,
+                        updated_at = CURRENT_TIMESTAMP
+                ''', (cookie_id, order_id, status, last_error))
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def get_delivery_dispatch(self, order_id: str, cookie_id: str = ""):
+        """读取订单派发状态。(v1.5: account-scoped)"""
+        if not cookie_id:
+            return None
+        with self.lock:
+            row = self.conn.execute('''
+                SELECT cookie_id, order_id, status, last_error, created_at, updated_at
+                FROM delivery_dispatches WHERE cookie_id = ? AND order_id = ?
+            ''', (cookie_id, order_id)).fetchone()
+            if not row:
                 return None
+            return {
+                "cookie_id": row[0],
+                "order_id": row[1],
+                "status": row[2],
+                "last_error": row[3],
+                "created_at": row[4],
+                "updated_at": row[5],
+            }
+
+    def commit_reserved_units(self, order_id: str, unit_indexes, cookie_id: str = "") -> bool:
+        """一次事务提交一组预留；任一单元状态异常则不修改任何记录。(v1.5: account-scoped)"""
+        indexes = sorted({int(index) for index in unit_indexes})
+        if not indexes or not cookie_id:
+            return False
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                placeholders = ",".join("?" for _ in indexes)
+                rows = cursor.execute(f'''
+                    SELECT unit_index, status FROM delivery_reservations
+                    WHERE cookie_id = ? AND order_id = ? AND unit_index IN ({placeholders})
+                ''', (cookie_id, order_id, *indexes)).fetchall()
+                status_by_index = {int(index): status for index, status in rows}
+                if set(status_by_index) != set(indexes):
+                    self.conn.rollback()
+                    return False
+                if any(status not in ('reserved', 'committed') for status in status_by_index.values()):
+                    self.conn.rollback()
+                    return False
+
+                cursor.execute(f'''
+                    UPDATE delivery_reservations
+                    SET status = 'committed', updated_at = CURRENT_TIMESTAMP
+                    WHERE cookie_id = ? AND order_id = ? AND unit_index IN ({placeholders})
+                      AND status = 'reserved'
+                ''', (cookie_id, order_id, *indexes))
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def commit_reserved_data(self, order_id: str, unit_index: int = 0, cookie_id: str = "") -> bool:
+        """服务端确认发送后提交单个预留；重复提交保持幂等。(v1.5: account-scoped)"""
+        return self.commit_reserved_units(order_id, [unit_index], cookie_id)
+
+    def rollback_reserved_data(self, order_id: str, unit_index: int = 0, cookie_id: str = "") -> bool:
+        """发送失败时归还预留资料；已提交记录绝不回滚。(v1.5: account-scoped)"""
+        if not cookie_id:
+            return False
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("BEGIN IMMEDIATE")
+                cursor.execute('''
+                SELECT card_id, content, status FROM delivery_reservations
+                WHERE cookie_id = ? AND order_id = ? AND unit_index = ?
+                ''', (cookie_id, order_id, unit_index))
+                row = cursor.fetchone()
+                if not row or row[2] != 'reserved':
+                    self.conn.rollback()
+                    return False
+                card_id, content, _ = row
+                cursor.execute("SELECT data_content FROM cards WHERE id = ?", (card_id,))
+                card = cursor.fetchone()
+                if not card:
+                    self.conn.rollback()
+                    return False
+                current = card[0] or ''
+                restored = content if not current.strip() else f"{content}\n{current}"
+                cursor.execute('''
+                UPDATE cards SET data_content = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                ''', (restored, card_id))
+                cursor.execute('''
+                UPDATE delivery_reservations
+                SET status = 'rolled_back', updated_at = CURRENT_TIMESTAMP
+                WHERE cookie_id = ? AND order_id = ? AND unit_index = ? AND status = 'reserved'
+                ''', (cookie_id, order_id, unit_index))
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def get_delivery_reservations(self, order_id: str, cookie_id: str = ""):
+        """读取订单全部预留，用于崩溃恢复。(v1.5: account-scoped)"""
+        if not cookie_id:
+            return []
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT cookie_id, order_id, unit_index, card_id, content, status, created_at, updated_at
+                FROM delivery_reservations
+                WHERE cookie_id = ? AND order_id = ? ORDER BY unit_index
+            ''', (cookie_id, order_id))
+            columns = [column[0] for column in cursor.description]
+            return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def get_delivery_reservation(self, order_id: str, unit_index: int = 0, cookie_id: str = ""):
+        """读取单个预留状态，用于恢复和测试。(v1.5: account-scoped)"""
+        reservations = self.get_delivery_reservations(order_id, cookie_id)
+        return next(
+            (
+                reservation for reservation in reservations
+                if reservation["unit_index"] == unit_index
+            ),
+            None,
+        )
+
+    def consume_batch_data(self, card_id: int, cookie_id: str = ""):
+        """兼容旧调用；生产发货必须改用 reserve/commit/rollback。(v1.5: account-scoped)"""
+        legacy_order_id = f"legacy-{time.time_ns()}"
+        content = self.reserve_batch_data(card_id, legacy_order_id, cookie_id=cookie_id)
+        if content:
+            self.commit_reserved_data(legacy_order_id, cookie_id=cookie_id)
+        return content
 
     # ==================== 商品信息管理 ====================
 
@@ -4291,35 +4937,41 @@ class DBManager:
                 # 开始事务
                 cursor.execute('BEGIN TRANSACTION')
 
-                # 删除用户相关的所有数据
-                # 1. 删除用户设置
-                cursor.execute('DELETE FROM user_settings WHERE user_id = ?', (user_id,))
-
-                # 2. 删除用户的卡券
-                cursor.execute('DELETE FROM cards WHERE user_id = ?', (user_id,))
-
-                # 3. 删除用户的发货规则
+                # 先删除依赖 Cookie 和卡券的记录，再删除父记录。显式顺序同时兼容
+                # 尚未启用 SQLite foreign_keys 的旧数据库。
+                cursor.execute('''
+                    DELETE FROM keywords
+                    WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)
+                ''', (user_id,))
+                cursor.execute('''
+                    DELETE FROM default_replies
+                    WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)
+                ''', (user_id,))
+                cursor.execute('''
+                    DELETE FROM ai_reply_settings
+                    WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)
+                ''', (user_id,))
+                cursor.execute('''
+                    DELETE FROM message_notifications
+                    WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)
+                ''', (user_id,))
+                cursor.execute('''
+                    DELETE FROM delivery_dispatches
+                    WHERE (cookie_id, order_id) IN (
+                        SELECT cookie_id, order_id
+                        FROM delivery_reservations
+                        WHERE card_id IN (SELECT id FROM cards WHERE user_id = ?)
+                    )
+                ''', (user_id,))
+                cursor.execute('''
+                    DELETE FROM delivery_reservations
+                    WHERE card_id IN (SELECT id FROM cards WHERE user_id = ?)
+                ''', (user_id,))
                 cursor.execute('DELETE FROM delivery_rules WHERE user_id = ?', (user_id,))
-
-                # 4. 删除用户的通知渠道
+                cursor.execute('DELETE FROM cards WHERE user_id = ?', (user_id,))
                 cursor.execute('DELETE FROM notification_channels WHERE user_id = ?', (user_id,))
-
-                # 5. 删除用户的Cookie
+                cursor.execute('DELETE FROM user_settings WHERE user_id = ?', (user_id,))
                 cursor.execute('DELETE FROM cookies WHERE user_id = ?', (user_id,))
-
-                # 6. 删除用户的关键字
-                cursor.execute('DELETE FROM keywords WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 7. 删除用户的默认回复
-                cursor.execute('DELETE FROM default_replies WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 8. 删除用户的AI回复设置
-                cursor.execute('DELETE FROM ai_reply_settings WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 9. 删除用户的消息通知
-                cursor.execute('DELETE FROM message_notifications WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
-
-                # 10. 最后删除用户本身
                 cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
 
                 # 提交事务
@@ -4366,106 +5018,98 @@ class DBManager:
     def insert_or_update_order(self, order_id: str, item_id: str = None, buyer_id: str = None,
                               spec_name: str = None, spec_value: str = None, quantity: str = None,
                               amount: str = None, order_status: str = None, cookie_id: str = None):
-        """插入或更新订单信息"""
+        """插入或更新订单信息 (v1.5: composite key)"""
+        if not cookie_id:
+            logger.warning("insert_or_update_order 缺少 cookie_id，拒绝操作")
+            return False
         with self.lock:
             try:
                 cursor = self.conn.cursor()
 
-                # 检查cookie_id是否在cookies表中存在（如果提供了cookie_id）
-                if cookie_id:
-                    cursor.execute("SELECT id FROM cookies WHERE id = ?", (cookie_id,))
-                    cookie_exists = cursor.fetchone()
-                    if not cookie_exists:
-                        logger.warning(f"Cookie ID {cookie_id} 不存在于cookies表中，拒绝插入订单 {order_id}")
-                        return False
+                cursor.execute("SELECT id FROM cookies WHERE id = ?", (cookie_id,))
+                if not cursor.fetchone():
+                    logger.warning(f"Cookie ID {cookie_id} 不存在，拒绝插入订单 {order_id}")
+                    return False
 
-                # 检查订单是否已存在
-                cursor.execute("SELECT order_id FROM orders WHERE order_id = ?", (order_id,))
+                cursor.execute(
+                    "SELECT order_id FROM orders WHERE cookie_id = ? AND order_id = ?",
+                    (cookie_id, order_id),
+                )
                 existing = cursor.fetchone()
 
                 if existing:
-                    # 更新现有订单
                     update_fields = []
                     update_values = []
 
                     if item_id is not None:
-                        update_fields.append("item_id = ?")
-                        update_values.append(item_id)
+                        update_fields.append("item_id = ?"); update_values.append(item_id)
                     if buyer_id is not None:
-                        update_fields.append("buyer_id = ?")
-                        update_values.append(buyer_id)
+                        update_fields.append("buyer_id = ?"); update_values.append(buyer_id)
                     if spec_name is not None:
-                        update_fields.append("spec_name = ?")
-                        update_values.append(spec_name)
+                        update_fields.append("spec_name = ?"); update_values.append(spec_name)
                     if spec_value is not None:
-                        update_fields.append("spec_value = ?")
-                        update_values.append(spec_value)
+                        update_fields.append("spec_value = ?"); update_values.append(spec_value)
                     if quantity is not None:
-                        update_fields.append("quantity = ?")
-                        update_values.append(quantity)
+                        update_fields.append("quantity = ?"); update_values.append(quantity)
                     if amount is not None:
-                        update_fields.append("amount = ?")
-                        update_values.append(amount)
+                        update_fields.append("amount = ?"); update_values.append(amount)
                     if order_status is not None:
-                        update_fields.append("order_status = ?")
-                        update_values.append(order_status)
-                    if cookie_id is not None:
-                        update_fields.append("cookie_id = ?")
-                        update_values.append(cookie_id)
+                        update_fields.append("order_status = ?"); update_values.append(order_status)
 
                     if update_fields:
                         update_fields.append("updated_at = CURRENT_TIMESTAMP")
-                        update_values.append(order_id)
-
-                        sql = f"UPDATE orders SET {', '.join(update_fields)} WHERE order_id = ?"
+                        update_values.extend([cookie_id, order_id])
+                        sql = (
+                            f"UPDATE orders SET {', '.join(update_fields)} "
+                            f"WHERE cookie_id = ? AND order_id = ?"
+                        )
                         cursor.execute(sql, update_values)
                         logger.info(f"更新订单信息: {order_id}")
                 else:
-                    # 插入新订单
                     cursor.execute('''
-                    INSERT INTO orders (order_id, item_id, buyer_id, spec_name, spec_value,
-                                      quantity, amount, order_status, cookie_id)
+                    INSERT INTO orders (cookie_id, order_id, item_id, buyer_id, spec_name, spec_value,
+                                      quantity, amount, order_status)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (order_id, item_id, buyer_id, spec_name, spec_value,
-                          quantity, amount, order_status or 'unknown', cookie_id))
+                    ''', (cookie_id, order_id, item_id, buyer_id, spec_name, spec_value,
+                          quantity, amount, order_status or 'unknown'))
                     logger.info(f"插入新订单: {order_id}")
 
                 self.conn.commit()
                 return True
-
             except Exception as e:
                 logger.error(f"插入或更新订单失败: {order_id} - {e}")
                 self.conn.rollback()
                 return False
 
-    def get_order_by_id(self, order_id: str):
-        """根据订单ID获取订单信息"""
+    def get_order_by_id(self, order_id: str, cookie_id: str = ""):
+        """根据订单ID获取订单信息 (v1.5: account-scoped)"""
+        if not cookie_id:
+            return None
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                       quantity, amount, order_status, cookie_id, created_at, updated_at
-                FROM orders WHERE order_id = ?
-                ''', (order_id,))
+                SELECT cookie_id, order_id, item_id, buyer_id, spec_name, spec_value,
+                       quantity, amount, order_status, created_at, updated_at
+                FROM orders WHERE cookie_id = ? AND order_id = ?
+                ''', (cookie_id, order_id))
 
                 row = cursor.fetchone()
                 if row:
                     return {
-                        'order_id': row[0],
-                        'item_id': row[1],
-                        'buyer_id': row[2],
-                        'spec_name': row[3],
-                        'spec_value': row[4],
-                        'quantity': row[5],
-                        'amount': row[6],
-                        'order_status': row[7],
-                        'cookie_id': row[8],
+                        'cookie_id': row[0],
+                        'order_id': row[1],
+                        'item_id': row[2],
+                        'buyer_id': row[3],
+                        'spec_name': row[4],
+                        'spec_value': row[5],
+                        'quantity': row[6],
+                        'amount': row[7],
+                        'order_status': row[8],
                         'created_at': row[9],
                         'updated_at': row[10]
                     }
                 return None
-
             except Exception as e:
                 logger.error(f"获取订单信息失败: {order_id} - {e}")
                 return None

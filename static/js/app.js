@@ -16,6 +16,108 @@ let dashboardData = {
 let accountKeywordCache = {};
 let cacheTimestamp = 0;
 const CACHE_DURATION = 30000; // 30秒缓存
+const PROJECT_INFO_API = 'https://xianyu.zhinianblog.cn';
+const MAX_REMOTE_JSON_BYTES = 256 * 1024;
+const XIANYU_VERIFICATION_HOSTS = [
+    '2.taobao.com',
+    'h5.m.goofish.com',
+    'passport.goofish.com',
+    'passport.taobao.com',
+    'login.taobao.com'
+];
+
+function isAllowedHostname(hostname, allowedHosts) {
+    const normalized = String(hostname || '').toLowerCase();
+    return allowedHosts.some(host => normalized === host || normalized.endsWith(`.${host}`));
+}
+
+function getSafeVerificationUrl(value) {
+    try {
+        const url = new URL(String(value || ''));
+        if (url.protocol !== 'https:' || !isAllowedHostname(url.hostname, XIANYU_VERIFICATION_HOSTS)) {
+            return null;
+        }
+        return url.href;
+    } catch (error) {
+        return null;
+    }
+}
+
+function getSafeImageUrl(value) {
+    try {
+        const url = new URL(String(value || ''), location.origin);
+        if (!['https:', 'http:'].includes(url.protocol)) return null;
+        if (url.protocol === 'http:' && url.origin !== location.origin) return null;
+        return url.href;
+    } catch (error) {
+        return null;
+    }
+}
+
+function getSafeItemUrl(value) {
+    try {
+        const url = new URL(String(value || ''));
+        const allowedHosts = ['2.taobao.com', 'goofish.com', 'm.goofish.com'];
+        if (url.protocol !== 'https:' || !isAllowedHostname(url.hostname, allowedHosts)) return null;
+        return url.href;
+    } catch (error) {
+        return null;
+    }
+}
+
+function findCookieField(cookieId, selector) {
+    return Array.from(document.querySelectorAll('[data-cookie-id]'))
+        .find(element => element.dataset.cookieId === String(cookieId))
+        ?.querySelector(selector) || null;
+}
+
+function toSafeCount(value) {
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= 0 ? number : 0;
+}
+
+function toSafeText(value, maxLength = 200) {
+    return typeof value === 'string' ? value.slice(0, maxLength) : '';
+}
+
+function toSafeDistribution(value, maxEntries = 50) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+    return Object.entries(value).slice(0, maxEntries).map(([label, count]) => [
+        toSafeText(label, 100),
+        toSafeCount(count)
+    ]);
+}
+
+function toSafeVersion(value) {
+    const version = toSafeText(value, 40).trim();
+    return /^v?\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?$/.test(version) ? version : '';
+}
+
+async function fetchTrustedProjectJson(path) {
+    const response = await fetch(`${PROJECT_INFO_API}${path}`, {
+        method: 'GET',
+        mode: 'cors',
+        credentials: 'omit',
+        referrerPolicy: 'no-referrer',
+        headers: { 'Accept': 'application/json' }
+    });
+    if (!response.ok) throw new Error(`远程服务返回 ${response.status}`);
+
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.toLowerCase().includes('application/json')) {
+        throw new Error('远程服务返回了非 JSON 内容');
+    }
+    const contentLength = Number(response.headers.get('content-length') || 0);
+    if (contentLength > MAX_REMOTE_JSON_BYTES) throw new Error('远程响应过大');
+
+    const text = await response.text();
+    if (text.length > MAX_REMOTE_JSON_BYTES) throw new Error('远程响应过大');
+    const value = JSON.parse(text);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('远程响应格式无效');
+    }
+    return value;
+}
 
 // 商品列表搜索和分页相关变量
 let allItemsData = []; // 存储所有商品数据
@@ -297,7 +399,7 @@ function updateDashboardAccountsList(accounts) {
     row.className = isEnabled ? '' : 'table-secondary';
     row.innerHTML = `
         <td>
-        <strong class="text-primary ${!isEnabled ? 'text-muted' : ''}">${account.id}</strong>
+        <strong class="text-primary ${!isEnabled ? 'text-muted' : ''}">${escapeHtml(String(account.id))}</strong>
         ${!isEnabled ? '<i class="bi bi-pause-circle-fill text-danger ms-1" title="已禁用"></i>' : ''}
         </td>
         <td>
@@ -831,11 +933,12 @@ function renderKeywordsList(keywords) {
         <i class="bi bi-chat-dots"></i>
         <h3>还没有关键词</h3>
         <p>添加第一个关键词，让您的闲鱼店铺自动回复客户消息</p>
-        <button class="quick-add-btn" onclick="focusKeywordInput()">
+        <button class="quick-add-btn" type="button">
             <i class="bi bi-plus-lg me-2"></i>立即添加
         </button>
         </div>
     `;
+    container.querySelector('.quick-add-btn').addEventListener('click', focusKeywordInput);
     return;
     }
 
@@ -856,51 +959,67 @@ function renderKeywordsList(keywords) {
         '<span class="keyword-type-badge keyword-type-image"><i class="bi bi-image"></i> 图片</span>' :
         '<span class="keyword-type-badge keyword-type-text"><i class="bi bi-chat-text"></i> 文本</span>';
 
-    // 商品ID显示
-    const itemIdDisplay = item.item_id ?
-        `<small class="text-muted d-block"><i class="bi bi-box"></i> 商品ID: ${item.item_id}</small>` :
-        '<small class="text-muted d-block"><i class="bi bi-globe"></i> 通用关键词</small>';
-
-    // 内容显示
-    let contentDisplay = '';
-    if (isImageType) {
-        // 图片类型显示图片预览
-        const imageUrl = item.reply || item.image_url || '';
-        contentDisplay = imageUrl ?
-            `<div class="d-flex align-items-center gap-3">
-                <img src="${imageUrl}" alt="关键词图片" class="keyword-image-preview" onclick="showImageModal('${imageUrl}')">
-                <div class="flex-grow-1">
-                    <p class="reply-text mb-0">用户发送关键词时将回复此图片</p>
-                    <small class="text-muted">点击图片查看大图</small>
-                </div>
-            </div>` :
-            '<p class="reply-text text-muted">图片加载失败</p>';
-    } else {
-        // 文本类型显示文本内容
-        contentDisplay = `<p class="reply-text">${item.reply || ''}</p>`;
-    }
-
     keywordItem.innerHTML = `
         <div class="keyword-item-header">
         <div class="keyword-tag">
             <i class="bi bi-tag-fill"></i>
-            ${item.keyword}
+            <span class="keyword-label"></span>
             ${typeBadge}
-            ${itemIdDisplay}
+            <small class="text-muted d-block item-id-label"></small>
         </div>
         <div class="keyword-actions">
-            <button class="action-btn edit-btn ${isImageType ? 'edit-btn-disabled' : ''}" onclick="${isImageType ? 'editImageKeyword' : 'editKeyword'}(${index})" title="${isImageType ? '图片关键词不支持编辑' : '编辑'}">
+            <button class="action-btn edit-btn ${isImageType ? 'edit-btn-disabled' : ''}" type="button" title="${isImageType ? '图片关键词不支持编辑' : '编辑'}">
             <i class="bi bi-pencil"></i>
             </button>
-            <button class="action-btn delete-btn" onclick="deleteKeyword('${currentCookieId}', ${index})" title="删除">
+            <button class="action-btn delete-btn" type="button" title="删除">
             <i class="bi bi-trash"></i>
             </button>
         </div>
         </div>
-        <div class="keyword-content">
-        ${contentDisplay}
-        </div>
+        <div class="keyword-content"></div>
     `;
+
+    keywordItem.querySelector('.keyword-label').textContent = String(item.keyword || '');
+    const itemIdLabel = keywordItem.querySelector('.item-id-label');
+    itemIdLabel.textContent = item.item_id ? `商品ID: ${String(item.item_id)}` : '通用关键词';
+
+    const content = keywordItem.querySelector('.keyword-content');
+    if (isImageType) {
+        const safeImageUrl = getSafeImageUrl(item.reply || item.image_url || '');
+        if (safeImageUrl) {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'd-flex align-items-center gap-3';
+            const image = document.createElement('img');
+            image.src = safeImageUrl;
+            image.alt = '关键词图片';
+            image.className = 'keyword-image-preview';
+            wrapper.appendChild(image);
+            const description = document.createElement('div');
+            description.className = 'flex-grow-1';
+            description.innerHTML = '<p class="reply-text mb-0">用户发送关键词时将回复此图片</p><small class="text-muted">点击图片查看大图</small>';
+            wrapper.appendChild(description);
+            content.appendChild(wrapper);
+        } else {
+            const fallback = document.createElement('p');
+            fallback.className = 'reply-text text-muted';
+            fallback.textContent = '图片地址无效';
+            content.appendChild(fallback);
+        }
+    } else {
+        const reply = document.createElement('p');
+        reply.className = 'reply-text';
+        reply.textContent = String(item.reply || '');
+        content.appendChild(reply);
+    }
+
+    const editButton = keywordItem.querySelector('.edit-btn');
+    editButton.addEventListener('click', () => {
+        if (isImageType) editImageKeyword(index);
+        else editKeyword(index);
+    });
+    keywordItem.querySelector('.delete-btn').addEventListener('click', () => {
+        deleteKeyword(currentCookieId, index);
+    });
     container.appendChild(keywordItem);
     });
 
@@ -1056,14 +1175,18 @@ function showToast(message, type = 'success') {
     toast.setAttribute('aria-live', 'assertive');
     toast.setAttribute('aria-atomic', 'true');
 
-    toast.innerHTML = `
-    <div class="d-flex">
-        <div class="toast-body">
-        ${message}
-        </div>
-        <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
-    </div>
-    `;
+    const wrapper = document.createElement('div');
+    wrapper.className = 'd-flex';
+    const body = document.createElement('div');
+    body.className = 'toast-body';
+    body.textContent = String(message);
+    const closeButton = document.createElement('button');
+    closeButton.type = 'button';
+    closeButton.className = 'btn-close btn-close-white me-2 m-auto';
+    closeButton.dataset.bsDismiss = 'toast';
+    closeButton.setAttribute('aria-label', 'Close');
+    wrapper.append(body, closeButton);
+    toast.appendChild(wrapper);
 
     toastContainer.appendChild(toast);
     const bsToast = new bootstrap.Toast(toast, { delay: 3000 });
@@ -1228,16 +1351,20 @@ async function loadCookies() {
 
         // 自动确认发货状态（默认开启）
         const autoConfirm = cookie.auto_confirm === undefined ? true : cookie.auto_confirm;
+        const cookieId = String(cookie.id);
+        const cookieValue = String(cookie.value || '');
+        const cookieRemark = String(cookie.remark || '');
+        const pauseDuration = Number.isFinite(Number(cookie.pause_duration)) ? Number(cookie.pause_duration) : 10;
 
         tr.innerHTML = `
         <td class="align-middle">
             <div class="cookie-id">
-            <strong class="text-primary">${cookie.id}</strong>
+            <strong class="text-primary">${escapeHtml(String(cookie.id))}</strong>
             </div>
         </td>
         <td class="align-middle">
             <div class="cookie-value" title="点击复制Cookie" style="font-family: monospace; font-size: 0.875rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-            ${cookie.value || '未设置'}
+            ${escapeHtml(String(cookie.value || '未设置'))}
             </div>
         </td>
         <td class="align-middle">
@@ -1248,7 +1375,7 @@ async function loadCookies() {
         <td class="align-middle">
             <div class="d-flex align-items-center gap-2">
             <label class="status-toggle" title="${isEnabled ? '点击禁用' : '点击启用'}">
-                <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleAccountStatus('${cookie.id}', this.checked)">
+                <input type="checkbox" class="account-status-toggle" ${isEnabled ? 'checked' : ''}>
                 <span class="status-slider"></span>
             </label>
             <span class="status-badge ${isEnabled ? 'enabled' : 'disabled'}" title="${isEnabled ? '账号已启用' : '账号已禁用'}">
@@ -1265,7 +1392,7 @@ async function loadCookies() {
         <td class="align-middle">
             <div class="d-flex align-items-center gap-2">
             <label class="status-toggle" title="${autoConfirm ? '点击关闭自动确认发货' : '点击开启自动确认发货'}">
-                <input type="checkbox" ${autoConfirm ? 'checked' : ''} onchange="toggleAutoConfirm('${cookie.id}', this.checked)">
+                <input type="checkbox" class="auto-confirm-toggle" ${autoConfirm ? 'checked' : ''}>
                 <span class="status-slider"></span>
             </label>
             <span class="status-badge ${autoConfirm ? 'enabled' : 'disabled'}" title="${autoConfirm ? '自动确认发货已开启' : '自动确认发货已关闭'}">
@@ -1274,39 +1401,67 @@ async function loadCookies() {
             </div>
         </td>
         <td class="align-middle">
-            <div class="remark-cell" data-cookie-id="${cookie.id}">
-                <span class="remark-display" onclick="editRemark('${cookie.id}', '${(cookie.remark || '').replace(/'/g, '&#39;')}')" title="点击编辑备注" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
-                    ${cookie.remark || '<i class="bi bi-plus-circle text-muted"></i> 添加备注'}
-                </span>
+            <div class="remark-cell">
+                <span class="remark-display" title="点击编辑备注" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;"></span>
             </div>
         </td>
         <td class="align-middle">
-            <div class="pause-duration-cell" data-cookie-id="${cookie.id}">
-                <span class="pause-duration-display" onclick="editPauseDuration('${cookie.id}', ${cookie.pause_duration !== undefined ? cookie.pause_duration : 10})" title="点击编辑暂停时间" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
-                    <i class="bi bi-clock me-1"></i>${cookie.pause_duration === 0 ? '不暂停' : (cookie.pause_duration || 10) + '分钟'}
-                </span>
+            <div class="pause-duration-cell">
+                <span class="pause-duration-display" title="点击编辑暂停时间" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;"></span>
             </div>
         </td>
         <td class="align-middle">
             <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-primary" onclick="editCookieInline('${cookie.id}', '${cookie.value}')" title="修改Cookie" ${!isEnabled ? 'disabled' : ''}>
+            <button class="btn btn-sm btn-outline-primary edit-cookie-btn" type="button" title="修改Cookie" ${!isEnabled ? 'disabled' : ''}>
                 <i class="bi bi-pencil"></i>
             </button>
-            <button class="btn btn-sm btn-outline-success" onclick="goToAutoReply('${cookie.id}')" title="${isEnabled ? '设置自动回复' : '配置关键词 (账号已禁用)'}">
+            <button class="btn btn-sm btn-outline-success auto-reply-btn" type="button" title="${isEnabled ? '设置自动回复' : '配置关键词 (账号已禁用)'}">
                 <i class="bi bi-arrow-right-circle"></i>
             </button>
-            <button class="btn btn-sm btn-outline-warning" onclick="configAIReply('${cookie.id}')" title="配置AI回复" ${!isEnabled ? 'disabled' : ''}>
+            <button class="btn btn-sm btn-outline-warning ai-reply-btn" type="button" title="配置AI回复" ${!isEnabled ? 'disabled' : ''}>
                 <i class="bi bi-robot"></i>
             </button>
-            <button class="btn btn-sm btn-outline-info" onclick="copyCookie('${cookie.id}', '${cookie.value}')" title="复制Cookie">
+            <button class="btn btn-sm btn-outline-info copy-cookie-btn" type="button" title="复制Cookie">
                 <i class="bi bi-clipboard"></i>
             </button>
-            <button class="btn btn-sm btn-outline-danger" onclick="delCookie('${cookie.id}')" title="删除账号">
+            <button class="btn btn-sm btn-outline-danger delete-cookie-btn" type="button" title="删除账号">
                 <i class="bi bi-trash"></i>
             </button>
             </div>
         </td>
         `;
+
+        const remarkCell = tr.querySelector('.remark-cell');
+        remarkCell.dataset.cookieId = cookieId;
+        const remarkDisplay = tr.querySelector('.remark-display');
+        if (cookieRemark) {
+            remarkDisplay.textContent = cookieRemark;
+        } else {
+            remarkDisplay.innerHTML = '<i class="bi bi-plus-circle text-muted"></i> 添加备注';
+        }
+        remarkDisplay.addEventListener('click', () => editRemark(cookieId, cookieRemark));
+
+        const pauseCell = tr.querySelector('.pause-duration-cell');
+        pauseCell.dataset.cookieId = cookieId;
+        const pauseDisplay = tr.querySelector('.pause-duration-display');
+        pauseDisplay.innerHTML = '<i class="bi bi-clock me-1"></i>';
+        pauseDisplay.appendChild(document.createTextNode(pauseDuration === 0 ? '不暂停' : `${pauseDuration}分钟`));
+        pauseDisplay.addEventListener('click', () => editPauseDuration(cookieId, pauseDuration));
+
+        tr.querySelector('.account-status-toggle').addEventListener('change', event => {
+            toggleAccountStatus(cookieId, event.currentTarget.checked);
+        });
+        tr.querySelector('.auto-confirm-toggle').addEventListener('change', event => {
+            toggleAutoConfirm(cookieId, event.currentTarget.checked);
+        });
+        tr.querySelector('.edit-cookie-btn').addEventListener('click', event => {
+            editCookieInline(cookieId, cookieValue, event.currentTarget);
+        });
+        tr.querySelector('.auto-reply-btn').addEventListener('click', () => goToAutoReply(cookieId));
+        tr.querySelector('.ai-reply-btn').addEventListener('click', () => configAIReply(cookieId));
+        tr.querySelector('.copy-cookie-btn').addEventListener('click', () => copyCookie(cookieId, cookieValue));
+        tr.querySelector('.delete-cookie-btn').addEventListener('click', () => delCookie(cookieId));
+
         tbody.appendChild(tr);
     });
 
@@ -1525,8 +1680,8 @@ async function delCookie(id) {
 }
 
 // 内联编辑Cookie
-function editCookieInline(id, currentValue) {
-    const row = event.target.closest('tr');
+function editCookieInline(id, currentValue, triggerButton) {
+    const row = triggerButton.closest('tr');
     const cookieValueCell = row.querySelector('.cookie-value');
     const originalContent = cookieValueCell.innerHTML;
 
@@ -2098,67 +2253,74 @@ function renderDefaultRepliesList(accounts, defaultReplies) {
     tbody.innerHTML = '';
 
     if (accounts.length === 0) {
-    tbody.innerHTML = `
-        <tr>
-        <td colspan="5" class="text-center py-4 text-muted">
-            <i class="bi bi-chat-text fs-1 d-block mb-3"></i>
-            <h5>暂无账号数据</h5>
-            <p class="mb-0">请先添加账号</p>
-        </td>
-        </tr>
-    `;
-    return;
+        tbody.innerHTML = `
+            <tr>
+            <td colspan="5" class="text-center py-4 text-muted">
+                <i class="bi bi-chat-text fs-1 d-block mb-3"></i>
+                <h5>暂无账号数据</h5>
+                <p class="mb-0">请先添加账号</p>
+            </td>
+            </tr>
+        `;
+        return;
     }
 
-    accounts.forEach(accountId => {
-    const replySettings = defaultReplies[accountId] || { enabled: false, reply_content: '', reply_once: false };
-    const tr = document.createElement('tr');
+    accounts.forEach(rawAccountId => {
+        const accountId = String(rawAccountId);
+        const replySettings = defaultReplies[accountId] || {
+            enabled: false,
+            reply_content: '',
+            reply_once: false
+        };
+        const replyContent = String(replySettings.reply_content || '');
+        const contentPreview = replyContent.length > 50
+            ? replyContent.substring(0, 50) + '...'
+            : (replyContent || '未设置');
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td><strong class="text-primary account-id"></strong></td>
+            <td><span class="badge reply-status"></span></td>
+            <td><span class="badge reply-once"></span></td>
+            <td><div class="text-truncate reply-preview" style="max-width: 300px;"></div></td>
+            <td><div class="btn-group reply-actions" role="group"></div></td>
+        `;
 
-    // 状态标签
-    const statusBadge = replySettings.enabled ?
-        '<span class="badge bg-success">启用</span>' :
-        '<span class="badge bg-secondary">禁用</span>';
+        tr.querySelector('.account-id').textContent = accountId;
+        const statusBadge = tr.querySelector('.reply-status');
+        statusBadge.className += replySettings.enabled ? ' bg-success' : ' bg-secondary';
+        statusBadge.textContent = replySettings.enabled ? '启用' : '禁用';
+        const replyOnceBadge = tr.querySelector('.reply-once');
+        replyOnceBadge.className += replySettings.reply_once
+            ? ' bg-warning'
+            : ' bg-light text-dark';
+        replyOnceBadge.textContent = replySettings.reply_once ? '是' : '否';
+        const preview = tr.querySelector('.reply-preview');
+        preview.textContent = contentPreview;
+        preview.title = replyContent;
 
-    // 只回复一次标签
-    const replyOnceBadge = replySettings.reply_once ?
-        '<span class="badge bg-warning">是</span>' :
-        '<span class="badge bg-light text-dark">否</span>';
-
-    // 回复内容预览
-    let contentPreview = replySettings.reply_content || '未设置';
-    if (contentPreview.length > 50) {
-        contentPreview = contentPreview.substring(0, 50) + '...';
-    }
-
-    tr.innerHTML = `
-        <td>
-        <strong class="text-primary">${accountId}</strong>
-        </td>
-        <td>${statusBadge}</td>
-        <td>${replyOnceBadge}</td>
-        <td>
-        <div class="text-truncate" style="max-width: 300px;" title="${replySettings.reply_content || ''}">
-            ${contentPreview}
-        </div>
-        </td>
-        <td>
-        <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-primary" onclick="editDefaultReply('${accountId}')" title="编辑">
-            <i class="bi bi-pencil"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-info" onclick="testDefaultReply('${accountId}')" title="测试">
-            <i class="bi bi-play"></i>
-            </button>
-            ${replySettings.reply_once ? `
-            <button class="btn btn-sm btn-outline-warning" onclick="clearDefaultReplyRecords('${accountId}')" title="清空记录">
-            <i class="bi bi-arrow-clockwise"></i>
-            </button>
-            ` : ''}
-        </div>
-        </td>
-    `;
-
-    tbody.appendChild(tr);
+        const actions = tr.querySelector('.reply-actions');
+        const addAction = (className, title, iconClass, handler) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = `btn btn-sm ${className}`;
+            button.title = title;
+            const icon = document.createElement('i');
+            icon.className = `bi ${iconClass}`;
+            button.appendChild(icon);
+            button.addEventListener('click', handler);
+            actions.appendChild(button);
+        };
+        addAction('btn-outline-primary', '编辑', 'bi-pencil', () => editDefaultReply(accountId));
+        addAction('btn-outline-info', '测试', 'bi-play', () => testDefaultReply(accountId));
+        if (replySettings.reply_once) {
+            addAction(
+                'btn-outline-warning',
+                '清空记录',
+                'bi-arrow-clockwise',
+                () => clearDefaultReplyRecords(accountId)
+            );
+        }
+        tbody.appendChild(tr);
     });
 }
 
@@ -2458,18 +2620,20 @@ async function testAIReply() {
 
     if (response.ok) {
         const result = await response.json();
-        testReplyContent.innerHTML = result.reply;
+        testReplyContent.textContent = result.reply || '';
         showToast('AI回复测试成功', 'success');
     } else {
         const error = await response.text();
-        testReplyContent.innerHTML = `<span class="text-danger">测试失败: ${error}</span>`;
+        testReplyContent.textContent = `测试失败: ${error}`;
+        testReplyContent.classList.add('text-danger');
         showToast(`测试失败: ${error}`, 'danger');
     }
 
     } catch (error) {
     console.error('测试AI回复失败:', error);
     const testReplyContent = document.getElementById('testReplyContent');
-    testReplyContent.innerHTML = `<span class="text-danger">测试失败: ${error.message}</span>`;
+    testReplyContent.textContent = `测试失败: ${error.message}`;
+    testReplyContent.classList.add('text-danger');
     showToast('测试AI回复失败', 'danger');
     }
 }
@@ -3014,15 +3178,16 @@ function renderNotificationChannels(channels) {
             return `${key}: ****`;
             }
             // 截断过长的值
-            const displayValue = value.length > 30 ? value.substring(0, 30) + '...' : value;
-            return `${key}: ${displayValue}`;
+            const textValue = String(value ?? '');
+            const displayValue = textValue.length > 30 ? textValue.substring(0, 30) + '...' : textValue;
+            return `${escapeHtml(String(key))}: ${escapeHtml(displayValue)}`;
         }).join('<br>');
         } else {
-        configDisplay = channel.config || '无配置';
+        configDisplay = escapeHtml(String(channel.config || '无配置'));
         }
     } catch (e) {
         // 兼容旧格式
-        configDisplay = channel.config || '无配置';
+        configDisplay = escapeHtml(String(channel.config || '无配置'));
         if (configDisplay.length > 30) {
         configDisplay = configDisplay.substring(0, 30) + '...';
         }
@@ -3033,23 +3198,26 @@ function renderNotificationChannels(channels) {
         <td>
         <div class="d-flex align-items-center">
             <i class="bi ${typeConfig ? typeConfig.icon : 'bi-bell'} me-2 text-${typeColor}"></i>
-            ${channel.name}
+            ${escapeHtml(String(channel.name || ''))}
         </div>
         </td>
-        <td><span class="badge bg-${typeColor}">${typeDisplay}</span></td>
+        <td><span class="badge bg-${typeColor}">${escapeHtml(String(typeDisplay || ''))}</span></td>
         <td><small class="text-muted">${configDisplay}</small></td>
         <td>${statusBadge}</td>
         <td>
         <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-primary" onclick="editNotificationChannel(${channel.id})" title="编辑">
+            <button class="btn btn-sm btn-outline-primary edit-channel-btn" type="button" title="编辑">
             <i class="bi bi-pencil"></i>
             </button>
-            <button class="btn btn-sm btn-outline-danger" onclick="deleteNotificationChannel(${channel.id})" title="删除">
+            <button class="btn btn-sm btn-outline-danger delete-channel-btn" type="button" title="删除">
             <i class="bi bi-trash"></i>
             </button>
         </div>
         </td>
     `;
+    const channelId = Number(channel.id);
+    tr.querySelector('.edit-channel-btn').addEventListener('click', () => editNotificationChannel(channelId));
+    tr.querySelector('.delete-channel-btn').addEventListener('click', () => deleteNotificationChannel(channelId));
 
     tbody.appendChild(tr);
     });
@@ -3282,54 +3450,68 @@ function renderMessageNotifications(accounts, notifications) {
     tbody.innerHTML = '';
 
     if (accounts.length === 0) {
-    tbody.innerHTML = `
-        <tr>
-        <td colspan="4" class="text-center py-4 text-muted">
-            <i class="bi bi-chat-dots fs-1 d-block mb-3"></i>
-            <h5>暂无账号数据</h5>
-            <p class="mb-0">请先添加账号</p>
-        </td>
-        </tr>
-    `;
-    return;
+        tbody.innerHTML = `
+            <tr>
+            <td colspan="4" class="text-center py-4 text-muted">
+                <i class="bi bi-chat-dots fs-1 d-block mb-3"></i>
+                <h5>暂无账号数据</h5>
+                <p class="mb-0">请先添加账号</p>
+            </td>
+            </tr>
+        `;
+        return;
     }
 
-    accounts.forEach(accountId => {
-    const accountNotifications = notifications[accountId] || [];
-    const tr = document.createElement('tr');
+    accounts.forEach(rawAccountId => {
+        const accountId = String(rawAccountId);
+        const accountNotifications = notifications[accountId] || [];
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td><strong class="text-primary account-id"></strong></td>
+            <td class="notification-channels"></td>
+            <td><span class="badge notification-status"></span></td>
+            <td><div class="btn-group notification-actions" role="group"></div></td>
+        `;
+        tr.querySelector('.account-id').textContent = accountId;
 
-    let channelsList = '';
-    if (accountNotifications.length > 0) {
-        channelsList = accountNotifications.map(n =>
-        `<span class="badge bg-${n.enabled ? 'success' : 'secondary'} me-1">${n.channel_name}</span>`
-        ).join('');
-    } else {
-        channelsList = '<span class="text-muted">未配置</span>';
-    }
+        const channelsCell = tr.querySelector('.notification-channels');
+        if (accountNotifications.length > 0) {
+            accountNotifications.forEach(notification => {
+                const badge = document.createElement('span');
+                badge.className = `badge bg-${notification.enabled ? 'success' : 'secondary'} me-1`;
+                badge.textContent = String(notification.channel_name || '未命名渠道');
+                channelsCell.appendChild(badge);
+            });
+        } else {
+            const empty = document.createElement('span');
+            empty.className = 'text-muted';
+            empty.textContent = '未配置';
+            channelsCell.appendChild(empty);
+        }
 
-    const status = accountNotifications.some(n => n.enabled) ?
-        '<span class="badge bg-success">启用</span>' :
-        '<span class="badge bg-secondary">禁用</span>';
+        const enabled = accountNotifications.some(notification => notification.enabled);
+        const statusBadge = tr.querySelector('.notification-status');
+        statusBadge.className += enabled ? ' bg-success' : ' bg-secondary';
+        statusBadge.textContent = enabled ? '启用' : '禁用';
 
-    tr.innerHTML = `
-        <td><strong class="text-primary">${accountId}</strong></td>
-        <td>${channelsList}</td>
-        <td>${status}</td>
-        <td>
-        <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-primary" onclick="configAccountNotification('${accountId}')" title="配置">
-            <i class="bi bi-gear"></i> 配置
-            </button>
-            ${accountNotifications.length > 0 ? `
-            <button class="btn btn-sm btn-outline-danger" onclick="deleteAccountNotification('${accountId}')" title="删除配置">
-            <i class="bi bi-trash"></i>
-            </button>
-            ` : ''}
-        </div>
-        </td>
-    `;
-
-    tbody.appendChild(tr);
+        const actions = tr.querySelector('.notification-actions');
+        const configButton = document.createElement('button');
+        configButton.type = 'button';
+        configButton.className = 'btn btn-sm btn-outline-primary';
+        configButton.title = '配置';
+        configButton.innerHTML = '<i class="bi bi-gear"></i> 配置';
+        configButton.addEventListener('click', () => configAccountNotification(accountId));
+        actions.appendChild(configButton);
+        if (accountNotifications.length > 0) {
+            const deleteButton = document.createElement('button');
+            deleteButton.type = 'button';
+            deleteButton.className = 'btn btn-sm btn-outline-danger';
+            deleteButton.title = '删除配置';
+            deleteButton.innerHTML = '<i class="bi bi-trash"></i>';
+            deleteButton.addEventListener('click', () => deleteAccountNotification(accountId));
+            actions.appendChild(deleteButton);
+        }
+        tbody.appendChild(tr);
     });
 }
 
@@ -3559,13 +3741,13 @@ function renderCardsList(cards) {
     // 规格信息显示
     let specDisplay = '<span class="text-muted">普通卡券</span>';
     if (card.is_multi_spec && card.spec_name && card.spec_value) {
-        specDisplay = `<span class="badge bg-primary">${card.spec_name}: ${card.spec_value}</span>`;
+        specDisplay = `<span class="badge bg-primary">${escapeHtml(String(card.spec_name))}: ${escapeHtml(String(card.spec_value))}</span>`;
     }
 
     tr.innerHTML = `
         <td>
-        <div class="fw-bold">${card.name}</div>
-        ${card.description ? `<small class="text-muted">${card.description}</small>` : ''}
+        <div class="fw-bold">${escapeHtml(String(card.name || ''))}</div>
+        ${card.description ? `<small class="text-muted">${escapeHtml(String(card.description))}</small>` : ''}
         </td>
         <td>${typeBadge}</td>
         <td>${specDisplay}</td>
@@ -3577,18 +3759,22 @@ function renderCardsList(cards) {
         </td>
         <td>
         <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-primary" onclick="editCard(${card.id})" title="编辑">
+            <button class="btn btn-sm btn-outline-primary edit-card-btn" type="button" title="编辑">
             <i class="bi bi-pencil"></i>
             </button>
-            <button class="btn btn-sm btn-outline-info" onclick="testCard(${card.id})" title="测试">
+            <button class="btn btn-sm btn-outline-info test-card-btn" type="button" title="测试">
             <i class="bi bi-play"></i>
             </button>
-            <button class="btn btn-sm btn-outline-danger" onclick="deleteCard(${card.id})" title="删除">
+            <button class="btn btn-sm btn-outline-danger delete-card-btn" type="button" title="删除">
             <i class="bi bi-trash"></i>
             </button>
         </div>
         </td>
     `;
+    const cardId = Number(card.id);
+    tr.querySelector('.edit-card-btn').addEventListener('click', () => editCard(cardId));
+    tr.querySelector('.test-card-btn').addEventListener('click', () => testCard(cardId));
+    tr.querySelector('.delete-card-btn').addEventListener('click', () => deleteCard(cardId));
 
     tbody.appendChild(tr);
     });
@@ -4222,14 +4408,14 @@ function renderDeliveryRulesList(rules) {
 
     tr.innerHTML = `
         <td>
-        <div class="fw-bold">${rule.keyword}</div>
-        ${rule.description ? `<small class="text-muted">${rule.description}</small>` : ''}
+        <div class="fw-bold">${escapeHtml(String(rule.keyword || ''))}</div>
+        ${rule.description ? `<small class="text-muted">${escapeHtml(String(rule.description))}</small>` : ''}
         </td>
         <td>
         <div>
-            <span class="badge bg-primary">${rule.card_name || '未知卡券'}</span>
+            <span class="badge bg-primary">${escapeHtml(String(rule.card_name || '未知卡券'))}</span>
             ${rule.is_multi_spec && rule.spec_name && rule.spec_value ?
-            `<br><small class="text-muted mt-1 d-block"><i class="bi bi-tags"></i> ${rule.spec_name}: ${rule.spec_value}</small>` :
+            `<br><small class="text-muted mt-1 d-block"><i class="bi bi-tags"></i> ${escapeHtml(String(rule.spec_name))}: ${escapeHtml(String(rule.spec_value))}</small>` :
             ''}
         </div>
         </td>
@@ -4242,18 +4428,22 @@ function renderDeliveryRulesList(rules) {
         </td>
         <td>
         <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-primary" onclick="editDeliveryRule(${rule.id})" title="编辑">
+            <button class="btn btn-sm btn-outline-primary edit-delivery-rule-btn" type="button" title="编辑">
             <i class="bi bi-pencil"></i>
             </button>
-            <button class="btn btn-sm btn-outline-info" onclick="testDeliveryRule(${rule.id})" title="测试">
+            <button class="btn btn-sm btn-outline-info test-delivery-rule-btn" type="button" title="测试">
             <i class="bi bi-play"></i>
             </button>
-            <button class="btn btn-sm btn-outline-danger" onclick="deleteDeliveryRule(${rule.id})" title="删除">
+            <button class="btn btn-sm btn-outline-danger delete-delivery-rule-btn" type="button" title="删除">
             <i class="bi bi-trash"></i>
             </button>
         </div>
         </td>
     `;
+    const ruleId = Number(rule.id);
+    tr.querySelector('.edit-delivery-rule-btn').addEventListener('click', () => editDeliveryRule(ruleId));
+    tr.querySelector('.test-delivery-rule-btn').addEventListener('click', () => testDeliveryRule(ruleId));
+    tr.querySelector('.delete-delivery-rule-btn').addEventListener('click', () => deleteDeliveryRule(ruleId));
 
     tbody.appendChild(tr);
     });
@@ -5583,7 +5773,7 @@ function displayCurrentPageItems() {
     const endIndex = startIndex + itemsPerPage;
     const currentPageItems = filteredItemsData.slice(startIndex, endIndex);
 
-    const itemsHtml = currentPageItems.map(item => {
+    const itemsHtml = currentPageItems.map((item, pageIndex) => {
         // 处理商品标题显示
         let itemTitleDisplay = item.item_title || '未设置';
         if (itemTitleDisplay.length > 30) {
@@ -5610,12 +5800,11 @@ function displayCurrentPageItems() {
             '<span class="badge bg-secondary">已关闭</span>';
 
         return `
-            <tr>
+            <tr data-page-index="${pageIndex}">
             <td>
                 <input type="checkbox" name="itemCheckbox"
                         data-cookie-id="${escapeHtml(item.cookie_id)}"
-                        data-item-id="${escapeHtml(item.item_id)}"
-                        onchange="updateSelectAllState()">
+                        data-item-id="${escapeHtml(item.item_id)}">
             </td>
             <td>${escapeHtml(item.cookie_id)}</td>
             <td>${escapeHtml(item.item_id)}</td>
@@ -5627,16 +5816,16 @@ function displayCurrentPageItems() {
             <td>${formatDateTime(item.updated_at)}</td>
             <td>
                 <div class="btn-group" role="group">
-                <button class="btn btn-sm btn-outline-primary" onclick="editItem('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}')" title="编辑详情">
+                <button class="btn btn-sm btn-outline-primary edit-item-btn" type="button" title="编辑详情">
                     <i class="bi bi-pencil"></i>
                 </button>
-                <button class="btn btn-sm btn-outline-danger" onclick="deleteItem('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}', '${escapeHtml(item.item_title || item.item_id)}')" title="删除">
+                <button class="btn btn-sm btn-outline-danger delete-item-btn" type="button" title="删除">
                     <i class="bi bi-trash"></i>
                 </button>
-                <button class="btn btn-sm ${isMultiSpec ? 'btn-warning' : 'btn-success'}" onclick="toggleItemMultiSpec('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}', ${!isMultiSpec})" title="${isMultiSpec ? '关闭多规格' : '开启多规格'}">
+                <button class="btn btn-sm ${isMultiSpec ? 'btn-warning' : 'btn-success'} multi-spec-btn" type="button" title="${isMultiSpec ? '关闭多规格' : '开启多规格'}">
                     <i class="bi ${isMultiSpec ? 'bi-toggle-on' : 'bi-toggle-off'}"></i>
                 </button>
-                <button class="btn btn-sm ${isMultiQuantityDelivery ? 'btn-warning' : 'btn-success'}" onclick="toggleItemMultiQuantityDelivery('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}', ${!isMultiQuantityDelivery})" title="${isMultiQuantityDelivery ? '关闭多数量发货' : '开启多数量发货'}">
+                <button class="btn btn-sm ${isMultiQuantityDelivery ? 'btn-warning' : 'btn-success'} multi-quantity-btn" type="button" title="${isMultiQuantityDelivery ? '关闭多数量发货' : '开启多数量发货'}">
                     <i class="bi ${isMultiQuantityDelivery ? 'bi-box-arrow-down' : 'bi-box-arrow-up'}"></i>
                 </button>
                 </div>
@@ -5647,6 +5836,17 @@ function displayCurrentPageItems() {
 
     // 更新表格内容
     tbody.innerHTML = itemsHtml;
+    tbody.querySelectorAll('tr[data-page-index]').forEach(row => {
+        const item = currentPageItems[Number(row.dataset.pageIndex)];
+        const cookieId = String(item.cookie_id);
+        const itemId = String(item.item_id);
+        const itemTitle = String(item.item_title || item.item_id);
+        row.querySelector('input[name="itemCheckbox"]').addEventListener('change', updateSelectAllState);
+        row.querySelector('.edit-item-btn').addEventListener('click', () => editItem(cookieId, itemId));
+        row.querySelector('.delete-item-btn').addEventListener('click', () => deleteItem(cookieId, itemId, itemTitle));
+        row.querySelector('.multi-spec-btn').addEventListener('click', () => toggleItemMultiSpec(cookieId, itemId, !Boolean(item.is_multi_spec)));
+        row.querySelector('.multi-quantity-btn').addEventListener('click', () => toggleItemMultiQuantityDelivery(cookieId, itemId, !Boolean(item.multi_quantity_delivery)));
+    });
 
     // 重置选择状态
     resetItemsSelection();
@@ -6327,7 +6527,7 @@ function displayItemReplays(items) {
     return;
     }
 
-    const itemsHtml = items.map(item => {
+    const itemsHtml = items.map((item, itemIndex) => {
     // 处理商品标题显示
     let itemTitleDisplay = item.item_title || '未设置';
     if (itemTitleDisplay.length > 30) {
@@ -6353,12 +6553,11 @@ function displayItemReplays(items) {
     }
 
     return `
-        <tr>
+        <tr data-reply-index="${itemIndex}">
          <td>
             <input type="checkbox" name="itemCheckbox"
                     data-cookie-id="${escapeHtml(item.cookie_id)}"
-                    data-item-id="${escapeHtml(item.item_id)}"
-                    onchange="updateSelectAllState()">
+                    data-item-id="${escapeHtml(item.item_id)}">
         </td>
         <td>${escapeHtml(item.cookie_id)}</td>
         <td>${escapeHtml(item.item_id)}</td>
@@ -6368,10 +6567,10 @@ function displayItemReplays(items) {
         <td>${formatDateTime(item.updated_at)}</td>
         <td>
             <div class="btn-group" role="group">
-            <button class="btn btn-sm btn-outline-primary" onclick="editItemReply('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}')" title="编辑详情">
+            <button class="btn btn-sm btn-outline-primary edit-item-reply-btn" type="button" title="编辑详情">
                 <i class="bi bi-pencil"></i>
             </button>
-            <button class="btn btn-sm btn-outline-danger" onclick="deleteItemReply('${escapeHtml(item.cookie_id)}', '${escapeHtml(item.item_id)}', '${escapeHtml(item.item_title || item.item_id)}')" title="删除">
+            <button class="btn btn-sm btn-outline-danger delete-item-reply-btn" type="button" title="删除">
                 <i class="bi bi-trash"></i>
             </button>
             </div>
@@ -6382,6 +6581,15 @@ function displayItemReplays(items) {
 
     // 更新表格内容
     tbody.innerHTML = itemsHtml;
+    tbody.querySelectorAll('tr[data-reply-index]').forEach(row => {
+        const item = items[Number(row.dataset.replyIndex)];
+        const cookieId = String(item.cookie_id);
+        const itemId = String(item.item_id);
+        const itemTitle = String(item.item_title || item.item_id);
+        row.querySelector('input[name="itemCheckbox"]').addEventListener('change', updateSelectAllState);
+        row.querySelector('.edit-item-reply-btn').addEventListener('click', () => editItemReply(cookieId, itemId));
+        row.querySelector('.delete-item-reply-btn').addEventListener('click', () => deleteItemReply(cookieId, itemId, itemTitle));
+    });
 
     // 重置选择状态
     const selectAllCheckbox = document.getElementById('selectAllItems');
@@ -6671,9 +6879,9 @@ function displayLogs() {
 
     return `
         <div class="log-entry ${levelClass}">
-        <span class="log-timestamp">${timestamp}</span>
-        <span class="log-level">[${log.level}]</span>
-        <span class="log-source">${log.source}:</span>
+        <span class="log-timestamp">${escapeHtml(String(timestamp))}</span>
+        <span class="log-level">[${escapeHtml(String(log.level || 'INFO'))}]</span>
+        <span class="log-source">${escapeHtml(String(log.source || 'system'))}:</span>
         <span class="log-message">${escapeHtml(log.message)}</span>
         </div>
     `;
@@ -7113,12 +7321,9 @@ function showQRCodeImage(qrCodeUrl) {
 
 // 显示二维码错误
 function showQRCodeError(message) {
-    document.getElementById('qrCodeContainer').innerHTML = `
-    <div class="text-danger">
-        <i class="bi bi-exclamation-triangle fs-1 mb-3"></i>
-        <p>${message}</p>
-    </div>
-    `;
+    const container = document.getElementById('qrCodeContainer');
+    container.innerHTML = '<div class="text-danger"><i class="bi bi-exclamation-triangle fs-1 mb-3"></i><p></p></div>';
+    container.querySelector('p').textContent = toSafeText(String(message || '二维码生成失败'), 300);
     document.getElementById('qrCodeImage').style.display = 'none';
     document.getElementById('statusText').textContent = '生成失败';
     document.getElementById('statusSpinner').style.display = 'none';
@@ -7199,43 +7404,14 @@ async function checkQRCodeStatus() {
 
 // 显示需要验证的提示
 function showVerificationRequired(data) {
-    if (data.verification_url) {
+    const verificationUrl = getSafeVerificationUrl(data && data.verification_url);
+    if (!verificationUrl) {
+        showQRCodeError('验证地址无效或不属于受信任的闲鱼域名');
+        return;
+    }
+
     document.getElementById('qrCodeContainer').style.display = 'none';
     document.getElementById('qrCodeImage').style.display = 'none';
-
-    const verificationHtml = `
-        <div class="text-center verification-panel">
-        <div class="mb-3">
-            <i class="bi bi-shield-exclamation text-warning" style="font-size: 3rem;"></i>
-        </div>
-        <h6 class="text-warning mb-2">风控验证 — 需要手机验证码</h6>
-        <p class="text-muted small mb-3">闲鱼检测到此账号需要安全验证</p>
-
-        <div class="iframe-wrapper mb-3" style="border:2px solid #ffc107; border-radius:8px; overflow:hidden; max-height:420px;">
-            <iframe src="${data.verification_url}"
-                style="width:100%; height:420px; border:none;"
-                sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
-                loading="lazy"
-                onerror="document.getElementById('iframeFallback').style.display='block';">
-            </iframe>
-            <div id="iframeFallback" style="display:none; padding:40px 20px; text-align:center; background:#fffbe6;">
-                <i class="bi bi-window-stack text-warning" style="font-size:2rem;"></i>
-                <p class="mt-2 mb-3">无法在弹窗内验证，请在外部窗口完成</p>
-                <a href="${data.verification_url}" target="_blank"
-                   class="btn btn-outline-warning"
-                   onclick="document.getElementById('btnVerifyDone').style.display='inline-block';">
-                    <i class="bi bi-box-arrow-up-right me-1"></i>打开验证页面
-                </a>
-            </div>
-        </div>
-
-        <button id="btnVerifyDone" class="btn btn-success px-4" style="display:none;"
-                onclick="refreshQRCode(); this.style.display='none';">
-            <i class="bi bi-arrow-repeat me-1"></i>验证完成，重新扫码
-        </button>
-        <small class="d-block text-muted mt-2" id="verifyHint">完成手机验证后点击上方按钮</small>
-        </div>
-    `;
 
     let verificationContainer = document.getElementById('verificationContainer');
     if (!verificationContainer) {
@@ -7243,19 +7419,62 @@ function showVerificationRequired(data) {
         verificationContainer.id = 'verificationContainer';
         document.querySelector('#qrCodeLoginModal .modal-body').appendChild(verificationContainer);
     }
+    verificationContainer.replaceChildren();
 
-    verificationContainer.innerHTML = verificationHtml;
+    const panel = document.createElement('div');
+    panel.className = 'text-center verification-panel';
+    panel.innerHTML = `
+        <div class="mb-3"><i class="bi bi-shield-exclamation text-warning" style="font-size: 3rem;"></i></div>
+        <h6 class="text-warning mb-2">风控验证，需要手机验证码</h6>
+        <p class="text-muted small mb-3">闲鱼检测到此账号需要安全验证</p>
+        <div class="iframe-wrapper mb-3" style="border:2px solid #ffc107; border-radius:8px; overflow:hidden; max-height:420px;"></div>
+        <button id="btnVerifyDone" class="btn btn-success px-4" type="button" style="display:none;"><i class="bi bi-arrow-repeat me-1"></i>验证完成，重新扫码</button>
+        <small class="d-block text-muted mt-2" id="verifyHint">完成手机验证后点击上方按钮</small>
+    `;
+
+    const frameWrapper = panel.querySelector('.iframe-wrapper');
+    const iframe = document.createElement('iframe');
+    iframe.src = verificationUrl;
+    iframe.style.cssText = 'width:100%; height:420px; border:none;';
+    iframe.sandbox = 'allow-scripts allow-forms allow-popups';
+    iframe.loading = 'lazy';
+    iframe.referrerPolicy = 'no-referrer';
+    iframe.title = '闲鱼安全验证';
+
+    const fallback = document.createElement('div');
+    fallback.style.cssText = 'display:none; padding:40px 20px; text-align:center; background:#fffbe6;';
+    fallback.innerHTML = '<i class="bi bi-window-stack text-warning" style="font-size:2rem;"></i><p class="mt-2 mb-3">无法在弹窗内验证，请在外部窗口完成</p>';
+    const externalLink = document.createElement('a');
+    externalLink.href = verificationUrl;
+    externalLink.target = '_blank';
+    externalLink.rel = 'noopener noreferrer';
+    externalLink.className = 'btn btn-outline-warning';
+    externalLink.innerHTML = '<i class="bi bi-box-arrow-up-right me-1"></i>打开验证页面';
+    fallback.appendChild(externalLink);
+
+    iframe.addEventListener('error', () => {
+        fallback.style.display = 'block';
+    });
+    externalLink.addEventListener('click', () => {
+        panel.querySelector('#btnVerifyDone').style.display = 'inline-block';
+    });
+    panel.querySelector('#btnVerifyDone').addEventListener('click', event => {
+        refreshQRCode();
+        event.currentTarget.style.display = 'none';
+    });
+
+    frameWrapper.append(iframe, fallback);
+    verificationContainer.appendChild(panel);
     verificationContainer.style.display = 'block';
 
     setTimeout(() => {
-        const btn = document.getElementById('btnVerifyDone');
-        const hint = document.getElementById('verifyHint');
+        const btn = panel.querySelector('#btnVerifyDone');
+        const hint = panel.querySelector('#verifyHint');
         if (btn) btn.style.display = 'inline-block';
         if (hint) hint.textContent = '看到验证通过后点击重新扫码按钮';
     }, 6000);
 
     showToast('账号需要手机验证，请在弹窗中完成验证', 'warning');
-    }
 }
 
 // 处理扫码成功
@@ -7591,7 +7810,11 @@ async function addImageKeyword() {
 
 // 显示图片模态框
 function showImageModal(imageUrl) {
-    // 创建模态框HTML
+    const safeImageUrl = getSafeImageUrl(imageUrl);
+    if (!safeImageUrl) {
+        showToast('图片地址无效', 'danger');
+        return;
+    }
     const modalHtml = `
         <div class="modal fade" id="imageViewModal" tabindex="-1">
             <div class="modal-dialog modal-lg modal-dialog-centered">
@@ -7600,9 +7823,7 @@ function showImageModal(imageUrl) {
                         <h5 class="modal-title">图片预览</h5>
                         <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                     </div>
-                    <div class="modal-body text-center">
-                        <img src="${imageUrl}" alt="关键词图片" style="max-width: 100%; max-height: 70vh; border-radius: 8px;">
-                    </div>
+                    <div class="modal-body text-center"></div>
                 </div>
             </div>
         </div>
@@ -7616,9 +7837,15 @@ function showImageModal(imageUrl) {
 
     // 添加新模态框
     document.body.insertAdjacentHTML('beforeend', modalHtml);
+    const modalElement = document.getElementById('imageViewModal');
+    const image = document.createElement('img');
+    image.src = safeImageUrl;
+    image.alt = '关键词图片';
+    image.style.cssText = 'max-width: 100%; max-height: 70vh; border-radius: 8px;';
+    modalElement.querySelector('.modal-body').appendChild(image);
 
     // 显示模态框
-    const modal = new bootstrap.Modal(document.getElementById('imageViewModal'));
+    const modal = new bootstrap.Modal(modalElement);
     modal.show();
 
     // 模态框关闭后移除DOM元素
@@ -7696,7 +7923,7 @@ async function exportKeywords() {
 // 编辑备注
 function editRemark(cookieId, currentRemark) {
     console.log('editRemark called:', cookieId, currentRemark); // 调试信息
-    const remarkCell = document.querySelector(`[data-cookie-id="${cookieId}"] .remark-display`);
+    const remarkCell = findCookieField(cookieId, '.remark-display');
     if (!remarkCell) {
         console.log('remarkCell not found'); // 调试信息
         return;
@@ -7756,12 +7983,14 @@ function editRemark(cookieId, currentRemark) {
             });
 
             if (response.ok) {
-                // 更新显示
-                remarkCell.innerHTML = `
-                    <span class="remark-display" onclick="editRemark('${cookieId}', '${newRemark.replace(/'/g, '&#39;')}')" title="点击编辑备注" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
-                        ${newRemark || '<i class="bi bi-plus-circle text-muted"></i> 添加备注'}
-                    </span>
-                `;
+                const display = document.createElement('span');
+                display.className = 'remark-display';
+                display.title = '点击编辑备注';
+                display.style.cssText = 'cursor: pointer; color: #6c757d; font-size: 0.875rem;';
+                if (newRemark) display.textContent = newRemark;
+                else display.innerHTML = '<i class="bi bi-plus-circle text-muted"></i> 添加备注';
+                display.addEventListener('click', () => editRemark(cookieId, newRemark));
+                remarkCell.replaceWith(display);
                 showToast('备注更新成功', 'success');
             } else {
                 const errorData = await response.json();
@@ -7809,7 +8038,7 @@ function editRemark(cookieId, currentRemark) {
 // 编辑暂停时间
 function editPauseDuration(cookieId, currentDuration) {
     console.log('editPauseDuration called:', cookieId, currentDuration); // 调试信息
-    const pauseCell = document.querySelector(`[data-cookie-id="${cookieId}"] .pause-duration-display`);
+    const pauseCell = findCookieField(cookieId, '.pause-duration-display');
     if (!pauseCell) {
         console.log('pauseCell not found'); // 调试信息
         return;
@@ -7879,12 +8108,14 @@ function editPauseDuration(cookieId, currentDuration) {
             });
 
             if (response.ok) {
-                // 更新显示
-                pauseCell.innerHTML = `
-                    <span class="pause-duration-display" onclick="editPauseDuration('${cookieId}', ${newDuration})" title="点击编辑暂停时间" style="cursor: pointer; color: #6c757d; font-size: 0.875rem;">
-                        <i class="bi bi-clock me-1"></i>${newDuration === 0 ? '不暂停' : newDuration + '分钟'}
-                    </span>
-                `;
+                const display = document.createElement('span');
+                display.className = 'pause-duration-display';
+                display.title = '点击编辑暂停时间';
+                display.style.cssText = 'cursor: pointer; color: #6c757d; font-size: 0.875rem;';
+                display.innerHTML = '<i class="bi bi-clock me-1"></i>';
+                display.appendChild(document.createTextNode(newDuration === 0 ? '不暂停' : `${newDuration}分钟`));
+                display.addEventListener('click', () => editPauseDuration(cookieId, newDuration));
+                pauseCell.replaceWith(display);
                 showToast('暂停时间更新成功', 'success');
             } else {
                 const errorData = await response.json();
@@ -8563,59 +8794,47 @@ function displayOrders() {
 
     // 生成表格行
     tbody.innerHTML = pageOrders.map(order => createOrderRow(order)).join('');
+    tbody.querySelectorAll('.order-detail-btn').forEach(button => {
+        button.addEventListener('click', () => {
+            showOrderDetail(decodeURIComponent(button.dataset.orderId || ''));
+        });
+    });
+    tbody.querySelectorAll('.order-delete-btn').forEach(button => {
+        button.addEventListener('click', () => {
+            deleteOrder(decodeURIComponent(button.dataset.orderId || ''));
+        });
+    });
 }
 
 // 创建订单行HTML
 function createOrderRow(order) {
     const statusClass = getOrderStatusClass(order.order_status);
     const statusText = getOrderStatusText(order.order_status);
+    const orderId = String(order.order_id || '');
+    const itemId = String(order.item_id || '');
+    const buyerId = String(order.buyer_id || '');
+    const specName = String(order.spec_name || '');
+    const specValue = String(order.spec_value || '');
+    const cookieId = String(order.cookie_id || '');
+    const quantity = Number.isFinite(Number(order.quantity)) ? Number(order.quantity) : '-';
+    const amount = String(order.amount || '0.00');
+    const encodedOrderId = encodeURIComponent(orderId);
 
     return `
         <tr>
-            <td>
-                <input type="checkbox" class="order-checkbox" value="${order.order_id}">
-            </td>
-            <td>
-                <span class="text-truncate d-inline-block" style="max-width: 120px;" title="${order.order_id}">
-                    ${order.order_id}
-                </span>
-            </td>
-            <td>
-                <span class="text-truncate d-inline-block" style="max-width: 100px;" title="${order.item_id || ''}">
-                    ${order.item_id || '-'}
-                </span>
-            </td>
-            <td>
-                <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${order.buyer_id || ''}">
-                    ${order.buyer_id || '-'}
-                </span>
-            </td>
-            <td>
-                ${order.spec_name && order.spec_value ?
-                    `<small class="text-muted">${order.spec_name}:</small><br>${order.spec_value}` :
-                    '-'
-                }
-            </td>
-            <td>${order.quantity || '-'}</td>
-            <td>
-                <span class="text-success fw-bold">¥${order.amount || '0.00'}</span>
-            </td>
-            <td>
-                <span class="badge ${statusClass}">${statusText}</span>
-            </td>
-            <td>
-                <span class="text-truncate d-inline-block" style="max-width: 80px;" title="${order.cookie_id || ''}">
-                    ${order.cookie_id || '-'}
-                </span>
-            </td>
+            <td><input type="checkbox" class="order-checkbox" value="${escapeHtml(orderId)}"></td>
+            <td><span class="text-truncate d-inline-block" style="max-width: 120px;" title="${escapeHtml(orderId)}">${escapeHtml(orderId)}</span></td>
+            <td><span class="text-truncate d-inline-block" style="max-width: 100px;" title="${escapeHtml(itemId)}">${escapeHtml(itemId || '-')}</span></td>
+            <td><span class="text-truncate d-inline-block" style="max-width: 80px;" title="${escapeHtml(buyerId)}">${escapeHtml(buyerId || '-')}</span></td>
+            <td>${specName && specValue ? `<small class="text-muted">${escapeHtml(specName)}:</small><br>${escapeHtml(specValue)}` : '-'}</td>
+            <td>${quantity}</td>
+            <td><span class="text-success fw-bold">¥${escapeHtml(amount)}</span></td>
+            <td><span class="badge ${statusClass}">${escapeHtml(statusText)}</span></td>
+            <td><span class="text-truncate d-inline-block" style="max-width: 80px;" title="${escapeHtml(cookieId)}">${escapeHtml(cookieId || '-')}</span></td>
             <td>
                 <div class="btn-group btn-group-sm" role="group">
-                    <button class="btn btn-outline-primary btn-sm" onclick="showOrderDetail('${order.order_id}')" title="查看详情">
-                        <i class="bi bi-eye"></i>
-                    </button>
-                    <button class="btn btn-outline-danger btn-sm" onclick="deleteOrder('${order.order_id}')" title="删除">
-                        <i class="bi bi-trash"></i>
-                    </button>
+                    <button class="btn btn-outline-primary btn-sm order-detail-btn" data-order-id="${escapeHtml(encodedOrderId)}" title="查看详情"><i class="bi bi-eye"></i></button>
+                    <button class="btn btn-outline-danger btn-sm order-delete-btn" data-order-id="${escapeHtml(encodedOrderId)}" title="删除"><i class="bi bi-trash"></i></button>
                 </div>
             </td>
         </tr>
@@ -8628,6 +8847,20 @@ function getOrderStatusClass(status) {
         'processing': 'bg-warning text-dark',
         'processed': 'bg-info text-white',
         'completed': 'bg-success text-white',
+        'delivered': 'bg-success text-white',
+        'delivered_pending_confirmation': 'bg-info text-white',
+        'delivered_manual_confirmation': 'bg-primary text-white',
+        'delivery_inventory_commit_pending': 'bg-warning text-dark',
+        'delivery_dispatch_ambiguous': 'bg-danger text-white',
+        'delivery_manual_required': 'bg-danger text-white',
+        'delivery_failed': 'bg-danger text-white',
+        'reserved': 'bg-info text-white',
+        'committed': 'bg-success text-white',
+        'rolled_back': 'bg-secondary text-white',
+        'dispatching': 'bg-warning text-dark',
+        'confirmed': 'bg-success text-white',
+        'ambiguous': 'bg-danger text-white',
+        'manual_required': 'bg-danger text-white',
         'unknown': 'bg-secondary text-white'
     };
     return statusMap[status] || 'bg-secondary text-white';
@@ -8639,6 +8872,20 @@ function getOrderStatusText(status) {
         'processing': '处理中',
         'processed': '已处理',
         'completed': '已完成',
+        'delivered': '已发货',
+        'delivered_pending_confirmation': '已发货，待平台确认',
+        'delivered_manual_confirmation': '已发货，需人工确认',
+        'delivery_inventory_commit_pending': '已发送，库存待提交',
+        'delivery_dispatch_ambiguous': '发送结果不明确，需人工处理',
+        'delivery_manual_required': '不支持原子自动发货，需人工处理',
+        'delivery_failed': '发货失败',
+        'reserved': '库存已预留',
+        'committed': '库存已提交',
+        'rolled_back': '库存预留已回滚',
+        'dispatching': '正在发送',
+        'confirmed': '发送已确认',
+        'ambiguous': '发送结果不明确',
+        'manual_required': '需人工处理',
         'unknown': '未知'
     };
     return statusMap[status] || '未知';
@@ -8783,6 +9030,19 @@ async function showOrderDetail(orderId) {
             return;
         }
 
+        const safeOrder = {
+            orderId: escapeHtml(String(order.order_id || '')),
+            itemId: escapeHtml(String(order.item_id || '未知')),
+            buyerId: escapeHtml(String(order.buyer_id || '未知')),
+            cookieId: escapeHtml(String(order.cookie_id || '未知')),
+            specName: escapeHtml(String(order.spec_name || '无')),
+            specValue: escapeHtml(String(order.spec_value || '无')),
+            quantity: escapeHtml(String(order.quantity || '1')),
+            amount: escapeHtml(String(order.amount || '0.00')),
+            createdAt: escapeHtml(String(formatDateTime(order.created_at))),
+            updatedAt: escapeHtml(String(formatDateTime(order.updated_at)))
+        };
+
         // 创建模态框内容
         const modalContent = `
             <div class="modal fade" id="orderDetailModal" tabindex="-1">
@@ -8800,20 +9060,20 @@ async function showOrderDetail(orderId) {
                                 <div class="col-md-6">
                                     <h6>基本信息</h6>
                                     <table class="table table-sm">
-                                        <tr><td>订单ID</td><td>${order.order_id}</td></tr>
-                                        <tr><td>商品ID</td><td>${order.item_id || '未知'}</td></tr>
-                                        <tr><td>买家ID</td><td>${order.buyer_id || '未知'}</td></tr>
-                                        <tr><td>Cookie账号</td><td>${order.cookie_id || '未知'}</td></tr>
-                                        <tr><td>订单状态</td><td><span class="badge ${getOrderStatusClass(order.order_status)}">${getOrderStatusText(order.order_status)}</span></td></tr>
+                                        <tr><td>订单ID</td><td>${safeOrder.orderId}</td></tr>
+                                        <tr><td>商品ID</td><td>${safeOrder.itemId}</td></tr>
+                                        <tr><td>买家ID</td><td>${safeOrder.buyerId}</td></tr>
+                                        <tr><td>Cookie账号</td><td>${safeOrder.cookieId}</td></tr>
+                                        <tr><td>订单状态</td><td><span class="badge ${getOrderStatusClass(order.order_status)}">${escapeHtml(getOrderStatusText(order.order_status))}</span></td></tr>
                                     </table>
                                 </div>
                                 <div class="col-md-6">
                                     <h6>商品信息</h6>
                                     <table class="table table-sm">
-                                        <tr><td>规格名称</td><td>${order.spec_name || '无'}</td></tr>
-                                        <tr><td>规格值</td><td>${order.spec_value || '无'}</td></tr>
-                                        <tr><td>数量</td><td>${order.quantity || '1'}</td></tr>
-                                        <tr><td>金额</td><td>¥${order.amount || '0.00'}</td></tr>
+                                        <tr><td>规格名称</td><td>${safeOrder.specName}</td></tr>
+                                        <tr><td>规格值</td><td>${safeOrder.specValue}</td></tr>
+                                        <tr><td>数量</td><td>${safeOrder.quantity}</td></tr>
+                                        <tr><td>金额</td><td>¥${safeOrder.amount}</td></tr>
                                     </table>
                                 </div>
                             </div>
@@ -8821,8 +9081,8 @@ async function showOrderDetail(orderId) {
                                 <div class="col-12">
                                     <h6>时间信息</h6>
                                     <table class="table table-sm">
-                                        <tr><td>创建时间</td><td>${formatDateTime(order.created_at)}</td></tr>
-                                        <tr><td>更新时间</td><td>${formatDateTime(order.updated_at)}</td></tr>
+                                        <tr><td>创建时间</td><td>${safeOrder.createdAt}</td></tr>
+                                        <tr><td>更新时间</td><td>${safeOrder.updatedAt}</td></tr>
                                     </table>
                                 </div>
                             </div>
@@ -8894,21 +9154,21 @@ async function loadItemDetailForOrder(itemId, cookieId) {
             content.innerHTML = `
                 <div class="card">
                     <div class="card-body">
-                        <h6 class="card-title">${item.item_title || '商品标题未知'}</h6>
-                        <p class="card-text">${item.item_description || '暂无描述'}</p>
+                        <h6 class="card-title">${escapeHtml(String(item.item_title || '商品标题未知'))}</h6>
+                        <p class="card-text">${escapeHtml(String(item.item_description || '暂无描述'))}</p>
                         <div class="row">
                             <div class="col-md-6">
-                                <small class="text-muted">分类：${item.item_category || '未知'}</small>
+                                <small class="text-muted">分类：${escapeHtml(String(item.item_category || '未知'))}</small>
                             </div>
                             <div class="col-md-6">
-                                <small class="text-muted">价格：${item.item_price || '未知'}</small>
+                                <small class="text-muted">价格：${escapeHtml(String(item.item_price || '未知'))}</small>
                             </div>
                         </div>
                         ${item.item_detail ? `
                             <div class="mt-2">
                                 <small class="text-muted">详情：</small>
                                 <div class="border p-2 mt-1" style="max-height: 200px; overflow-y: auto;">
-                                    <small>${item.item_detail}</small>
+                                    <small>${escapeHtml(String(item.item_detail))}</small>
                                 </div>
                             </div>
                         ` : ''}
@@ -9196,38 +9456,46 @@ function createUserCard(user) {
     const col = document.createElement('div');
     col.className = 'col-md-6 col-lg-4 mb-3';
 
-    const isAdmin = user.username === 'admin';
-    const badgeClass = isAdmin ? 'bg-danger' : 'bg-primary';
-    const badgeText = isAdmin ? '管理员' : '普通用户';
-
+    const username = String(user.username || '未命名用户');
+    const isAdmin = username === 'admin';
+    const cookieCount = Number.isFinite(Number(user.cookie_count)) ? Number(user.cookie_count) : 0;
+    const cardCount = Number.isFinite(Number(user.card_count)) ? Number(user.card_count) : 0;
     col.innerHTML = `
         <div class="card user-card h-100">
             <div class="card-body">
                 <div class="d-flex justify-content-between align-items-start mb-2">
-                    <h6 class="card-title mb-0">${user.username}</h6>
-                    <span class="badge ${badgeClass}">${badgeText}</span>
+                    <h6 class="card-title mb-0 user-name"></h6>
+                    <span class="badge user-role"></span>
                 </div>
-                <p class="card-text text-muted small">
-                    <i class="bi bi-envelope me-1"></i>${user.email || '未设置邮箱'}
-                </p>
-                <p class="card-text text-muted small">
-                    <i class="bi bi-calendar me-1"></i>注册时间：${formatDateTime(user.created_at)}
-                </p>
+                <p class="card-text text-muted small user-email"><i class="bi bi-envelope me-1"></i></p>
+                <p class="card-text text-muted small user-created"><i class="bi bi-calendar me-1"></i></p>
                 <div class="d-flex justify-content-between align-items-center">
-                    <small class="text-muted">
-                        Cookie数: ${user.cookie_count || 0} |
-                        卡券数: ${user.card_count || 0}
-                    </small>
-                    ${!isAdmin ? `
-                        <button class="btn btn-outline-danger btn-sm" onclick="deleteUser('${user.id}', '${user.username}')">
-                            <i class="bi bi-trash"></i>
-                        </button>
-                    ` : ''}
+                    <small class="text-muted user-counts"></small>
+                    <div class="user-actions"></div>
                 </div>
             </div>
         </div>
     `;
-
+    col.querySelector('.user-name').textContent = username;
+    const roleBadge = col.querySelector('.user-role');
+    roleBadge.className += isAdmin ? ' bg-danger' : ' bg-primary';
+    roleBadge.textContent = isAdmin ? '管理员' : '普通用户';
+    col.querySelector('.user-email').append(
+        document.createTextNode(String(user.email || '未设置邮箱'))
+    );
+    col.querySelector('.user-created').append(
+        document.createTextNode(`注册时间：${formatDateTime(user.created_at)}`)
+    );
+    col.querySelector('.user-counts').textContent = `Cookie数: ${cookieCount} | 卡券数: ${cardCount}`;
+    if (!isAdmin) {
+        const deleteButton = document.createElement('button');
+        deleteButton.type = 'button';
+        deleteButton.className = 'btn btn-outline-danger btn-sm';
+        deleteButton.title = '删除用户';
+        deleteButton.innerHTML = '<i class="bi bi-trash"></i>';
+        deleteButton.addEventListener('click', () => deleteUser(user.id, username));
+        col.querySelector('.user-actions').appendChild(deleteButton);
+    }
     return col;
 }
 
@@ -9459,34 +9727,55 @@ function displayTableData(data, columns) {
 
     // 生成表头（添加操作列）
     const tableHeaders = document.getElementById('tableHeaders');
-    const headerHtml = columns.map(col => `<th>${col}</th>`).join('') + '<th width="100">操作</th>';
-    tableHeaders.innerHTML = headerHtml;
+    tableHeaders.innerHTML = '';
+    columns.forEach(column => {
+        const header = document.createElement('th');
+        header.textContent = String(column);
+        tableHeaders.appendChild(header);
+    });
+    const actionHeader = document.createElement('th');
+    actionHeader.width = '100';
+    actionHeader.textContent = '操作';
+    tableHeaders.appendChild(actionHeader);
 
     // 生成表格内容（添加删除按钮）
     const tableBody = document.getElementById('tableBody');
-    tableBody.innerHTML = data.map((row, index) => {
-        const dataCells = columns.map(col => {
-            let value = row[col];
+    tableBody.replaceChildren();
+    data.forEach((row, index) => {
+        const tableRow = document.createElement('tr');
+        columns.forEach(column => {
+            const cell = document.createElement('td');
+            const value = row[column];
             if (value === null || value === undefined) {
-                value = '<span class="text-muted">NULL</span>';
-            } else if (typeof value === 'string' && value.length > 50) {
-                value = `<span title="${escapeHtml(value)}">${escapeHtml(value.substring(0, 50))}...</span>`;
+                const nullValue = document.createElement('span');
+                nullValue.className = 'text-muted';
+                nullValue.textContent = 'NULL';
+                cell.appendChild(nullValue);
             } else {
-                value = escapeHtml(String(value));
+                const text = String(value);
+                if (text.length > 50) {
+                    const preview = document.createElement('span');
+                    preview.title = text;
+                    preview.textContent = `${text.slice(0, 50)}...`;
+                    cell.appendChild(preview);
+                } else {
+                    cell.textContent = text;
+                }
             }
-            return `<td>${value}</td>`;
-        }).join('');
+            tableRow.appendChild(cell);
+        });
 
-        // 添加操作列（删除按钮）
-        const recordId = row.id || row.user_id || index;
-        const actionCell = `<td>
-            <button class="btn btn-danger btn-sm" onclick="deleteRecordByIndex(${index})" title="删除记录">
-                <i class="bi bi-trash"></i>
-            </button>
-        </td>`;
-
-        return `<tr>${dataCells}${actionCell}</tr>`;
-    }).join('');
+        const actionCell = document.createElement('td');
+        const deleteButton = document.createElement('button');
+        deleteButton.type = 'button';
+        deleteButton.className = 'btn btn-danger btn-sm';
+        deleteButton.title = '删除记录';
+        deleteButton.innerHTML = '<i class="bi bi-trash"></i>';
+        deleteButton.addEventListener('click', () => deleteRecordByIndex(index));
+        actionCell.appendChild(deleteButton);
+        tableRow.appendChild(actionCell);
+        tableBody.appendChild(tableRow);
+    });
 }
 
 // HTML转义函数
@@ -9498,8 +9787,10 @@ function escapeHtml(text) {
 
 // 更新表格信息
 function updateTableInfo(tableName, recordCount) {
-    const description = tableDescriptions[tableName] || tableName;
-    document.getElementById('tableTitle').innerHTML = `<i class="bi bi-table"></i> ${description}`;
+    const description = String(tableDescriptions[tableName] || tableName);
+    const title = document.getElementById('tableTitle');
+    title.innerHTML = '<i class="bi bi-table"></i> ';
+    title.appendChild(document.createTextNode(description));
     document.getElementById('recordCount').textContent = recordCount;
 
     // 启用清空按钮
@@ -9641,7 +9932,10 @@ function deleteRecord(record, index) {
 
     Object.keys(record).forEach(key => {
         const div = document.createElement('div');
-        div.innerHTML = `<strong>${key}:</strong> ${record[key] || '-'}`;
+        const label = document.createElement('strong');
+        label.textContent = `${key}:`;
+        div.appendChild(label);
+        div.appendChild(document.createTextNode(` ${record[key] ?? '-'}`));
         deleteRecordInfo.appendChild(div);
     });
 
@@ -9982,54 +10276,52 @@ function displaySearchResults() {
 
 // 创建商品卡片
 function createItemCard(item) {
-    console.log('createItemCard被调用，item数据:', item);
-    console.log('item的所有字段:', Object.keys(item));
-
     const col = document.createElement('div');
     col.className = 'col-md-6 col-lg-4 col-xl-3 mb-4';
-
-    // 修复字段映射：使用main_image而不是image_url
-    const imageUrl = item.main_image || item.image_url || 'https://via.placeholder.com/200x200?text=图片加载失败';
-    const wantCount = item.want_count || 0;
-
-    console.log('处理后的数据:', {
-        title: item.title,
-        price: item.price,
-        seller_name: item.seller_name,
-        imageUrl: imageUrl,
-        wantCount: wantCount,
-        url: item.item_url || item.url
-    });
-
     col.innerHTML = `
         <div class="card item-card h-100">
-            <img src="${escapeHtml(imageUrl)}" class="item-image" alt="${escapeHtml(item.title)}"
-                 onerror="this.src='https://via.placeholder.com/200x200?text=图片加载失败'"
-                 style="width: 100%; height: 200px; object-fit: cover; border-radius: 10px;">
+            <img class="item-image" style="width: 100%; height: 200px; object-fit: cover; border-radius: 10px;">
             <div class="card-body d-flex flex-column">
-                <h6 class="card-title" title="${escapeHtml(item.title)}">
-                    ${escapeHtml(item.title.length > 50 ? item.title.substring(0, 50) + '...' : item.title)}
-                </h6>
-                <div class="price mb-2" style="color: #e74c3c; font-weight: bold; font-size: 1.2em;">
-                    ${escapeHtml(item.price)}
-                </div>
-                <div class="seller-name mb-2" style="color: #6c757d; font-size: 0.9em;">
-                    <i class="bi bi-person me-1"></i>
-                    ${escapeHtml(item.seller_name)}
-                </div>
-                ${wantCount > 0 ? `<div class="want-count mb-2">
-                    <i class="bi bi-heart-fill me-1" style="color: #ff6b6b;"></i>
-                    <span class="badge bg-danger">${wantCount}人想要</span>
-                </div>` : ''}
-                <div class="mt-auto">
-                    <a href="${escapeHtml(item.item_url || item.url)}" target="_blank" class="btn btn-primary btn-sm w-100">
-                        <i class="bi bi-eye me-1"></i>查看详情
-                    </a>
-                </div>
+                <h6 class="card-title"></h6>
+                <div class="price mb-2" style="color: #e74c3c; font-weight: bold; font-size: 1.2em;"></div>
+                <div class="seller-name mb-2" style="color: #6c757d; font-size: 0.9em;"><i class="bi bi-person me-1"></i><span></span></div>
+                <div class="want-count mb-2" style="display:none;"><i class="bi bi-heart-fill me-1" style="color: #ff6b6b;"></i><span class="badge bg-danger"></span></div>
+                <div class="mt-auto"><a target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm w-100"><i class="bi bi-eye me-1"></i>查看详情</a></div>
             </div>
         </div>
     `;
 
+    const title = toSafeText(item.title, 500) || '未命名商品';
+    const image = col.querySelector('.item-image');
+    const fallbackImage = 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22200%22 height=%22200%22%3E%3Crect width=%22100%25%22 height=%22100%25%22 fill=%22%23e9ecef%22/%3E%3C/svg%3E';
+    image.src = getSafeImageUrl(item.main_image || item.image_url) || fallbackImage;
+    image.alt = title;
+    image.addEventListener('error', () => {
+        image.src = fallbackImage;
+    }, { once: true });
+
+    const titleElement = col.querySelector('.card-title');
+    titleElement.title = title;
+    titleElement.textContent = title.length > 50 ? `${title.slice(0, 50)}...` : title;
+    col.querySelector('.price').textContent = toSafeText(String(item.price || ''), 80);
+    col.querySelector('.seller-name span').textContent = toSafeText(item.seller_name, 100);
+
+    const wantCount = toSafeCount(item.want_count);
+    if (wantCount > 0) {
+        const want = col.querySelector('.want-count');
+        want.style.display = '';
+        want.querySelector('.badge').textContent = `${wantCount}人想要`;
+    }
+
+    const detailLink = col.querySelector('a');
+    const itemUrl = getSafeItemUrl(item.item_url || item.url);
+    if (itemUrl) detailLink.href = itemUrl;
+    else {
+        detailLink.removeAttribute('href');
+        detailLink.classList.add('disabled');
+        detailLink.setAttribute('aria-disabled', 'true');
+        detailLink.title = '商品链接无效';
+    }
     return col;
 }
 
@@ -10045,46 +10337,38 @@ function updateSearchStats(data) {
 // 更新搜索分页
 function updateSearchPagination() {
     const paginationContainer = document.getElementById('searchPagination');
-    paginationContainer.innerHTML = '';
-
+    paginationContainer.replaceChildren();
     if (totalSearchPages <= 1) return;
 
     const pagination = document.createElement('nav');
-    pagination.innerHTML = `
-        <ul class="pagination">
-            <li class="page-item ${currentSearchPage === 1 ? 'disabled' : ''}">
-                <a class="page-link" href="#" onclick="changeSearchPage(${currentSearchPage - 1})">上一页</a>
-            </li>
-            ${generateSearchPageNumbers()}
-            <li class="page-item ${currentSearchPage === totalSearchPages ? 'disabled' : ''}">
-                <a class="page-link" href="#" onclick="changeSearchPage(${currentSearchPage + 1})">下一页</a>
-            </li>
-        </ul>
-    `;
+    const list = document.createElement('ul');
+    list.className = 'pagination';
+    const addPage = (label, page, disabled = false, active = false) => {
+        const item = document.createElement('li');
+        item.className = `page-item${disabled ? ' disabled' : ''}${active ? ' active' : ''}`;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'page-link';
+        button.textContent = String(label);
+        button.disabled = disabled;
+        button.addEventListener('click', () => changeSearchPage(page));
+        item.appendChild(button);
+        list.appendChild(item);
+    };
 
-    paginationContainer.appendChild(pagination);
-}
-
-// 生成搜索分页页码
-function generateSearchPageNumbers() {
-    let pageNumbers = '';
+    addPage('上一页', currentSearchPage - 1, currentSearchPage === 1);
     const maxVisiblePages = 5;
     let startPage = Math.max(1, currentSearchPage - Math.floor(maxVisiblePages / 2));
     let endPage = Math.min(totalSearchPages, startPage + maxVisiblePages - 1);
-
     if (endPage - startPage + 1 < maxVisiblePages) {
         startPage = Math.max(1, endPage - maxVisiblePages + 1);
     }
-
-    for (let i = startPage; i <= endPage; i++) {
-        pageNumbers += `
-            <li class="page-item ${i === currentSearchPage ? 'active' : ''}">
-                <a class="page-link" href="#" onclick="changeSearchPage(${i})">${i}</a>
-            </li>
-        `;
+    for (let page = startPage; page <= endPage; page += 1) {
+        addPage(page, page, false, page === currentSearchPage);
     }
-
-    return pageNumbers;
+    addPage('下一页', currentSearchPage + 1, currentSearchPage === totalSearchPages);
+    pagination.appendChild(list);
+    paginationContainer.appendChild(pagination);
 }
 
 // 切换搜索页面
@@ -10155,25 +10439,20 @@ function exportSearchResults() {
  */
 async function loadProjectUsers() {
     try {
-        const response = await fetch('http://xianyu.zhinianblog.cn/?action=stats');
-        const result = await response.json();
-
+        const result = await fetchTrustedProjectJson('/?action=stats');
         if (result.error) {
-            console.error('获取项目使用人数失败:', result.error);
+            console.error('获取项目使用人数失败');
             document.getElementById('totalUsers').textContent = '获取失败';
             return;
         }
 
-        const totalUsers = result.total_users || 0;
-        document.getElementById('totalUsers').textContent = totalUsers;
-
-        // 如果用户数量大于0，可以添加一些视觉效果
+        const totalUsers = toSafeCount(result.total_users);
+        document.getElementById('totalUsers').textContent = String(totalUsers);
         if (totalUsers > 0) {
             const usersElement = document.getElementById('projectUsers');
             usersElement.classList.remove('bg-primary');
             usersElement.classList.add('bg-success');
         }
-
     } catch (error) {
         console.error('获取项目使用人数失败:', error);
         document.getElementById('totalUsers').textContent = '网络错误';
@@ -10198,13 +10477,18 @@ function startProjectUsersRefresh() {
  */
 async function showProjectStats() {
     try {
-        const response = await fetch('http://xianyu.zhinianblog.cn/?action=stats');
-        const data = await response.json();
-
-        if (data.error) {
-            showToast('获取统计信息失败: ' + data.error, 'danger');
+        const rawData = await fetchTrustedProjectJson('/?action=stats');
+        if (rawData.error) {
+            showToast('获取统计信息失败', 'danger');
             return;
         }
+        const data = {
+            total_users: toSafeCount(rawData.total_users),
+            daily_active_users: toSafeCount(rawData.daily_active_users),
+            os_distribution: toSafeDistribution(rawData.os_distribution),
+            version_distribution: toSafeDistribution(rawData.version_distribution),
+            last_updated: toSafeText(rawData.last_updated, 80) || '未知'
+        };
 
         // 创建模态框HTML
         const modalHtml = `
@@ -10233,13 +10517,13 @@ async function showProjectStats() {
                                 </div>
                                 <div class="col-md-3">
                                     <div class="text-center p-3 bg-light rounded">
-                                        <div class="h2 text-info mb-1">${Object.keys(data.os_distribution || {}).length}</div>
+                                        <div class="h2 text-info mb-1">${data.os_distribution.length}</div>
                                         <div class="text-muted">操作系统类型</div>
                                     </div>
                                 </div>
                                 <div class="col-md-3">
                                     <div class="text-center p-3 bg-light rounded">
-                                        <div class="h2 text-warning mb-1">${Object.keys(data.version_distribution || {}).length}</div>
+                                        <div class="h2 text-warning mb-1">${data.version_distribution.length}</div>
                                         <div class="text-muted">版本类型</div>
                                     </div>
                                 </div>
@@ -10252,12 +10536,7 @@ async function showProjectStats() {
                                             <h6 class="mb-0"><i class="bi bi-laptop me-2"></i>操作系统分布</h6>
                                         </div>
                                         <div class="card-body">
-                                            ${Object.entries(data.os_distribution || {}).map(([os, count]) => `
-                                                <div class="d-flex justify-content-between align-items-center mb-2">
-                                                    <span>${os}</span>
-                                                    <span class="badge bg-primary">${count}</span>
-                                                </div>
-                                            `).join('')}
+                                            <div id="projectOsDistribution"></div>
                                         </div>
                                     </div>
                                 </div>
@@ -10267,24 +10546,19 @@ async function showProjectStats() {
                                             <h6 class="mb-0"><i class="bi bi-tag me-2"></i>版本分布</h6>
                                         </div>
                                         <div class="card-body">
-                                            ${Object.entries(data.version_distribution || {}).map(([version, count]) => `
-                                                <div class="d-flex justify-content-between align-items-center mb-2">
-                                                    <span>${version}</span>
-                                                    <span class="badge bg-success">${count}</span>
-                                                </div>
-                                            `).join('')}
+                                            <div id="projectVersionDistribution"></div>
                                         </div>
                                     </div>
                                 </div>
                             </div>
 
                             <div class="mt-3 text-muted text-center">
-                                <small>最后更新: ${data.last_updated || '未知'}</small>
+                                <small>最后更新: <span id="projectStatsUpdated"></span></small>
                             </div>
                         </div>
                         <div class="modal-footer">
                             <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
-                            <button type="button" class="btn btn-primary" onclick="loadProjectUsers()">刷新数据</button>
+                            <button type="button" class="btn btn-primary" id="refreshProjectStats">刷新数据</button>
                         </div>
                     </div>
                 </div>
@@ -10297,15 +10571,34 @@ async function showProjectStats() {
             existingModal.remove();
         }
 
-        // 添加新模态框到页面
+        // 添加新模态框到页面。模板仅包含本地固定标记，远程数据通过 textContent 写入。
         document.body.insertAdjacentHTML('beforeend', modalHtml);
+        const modalElement = document.getElementById('projectStatsModal');
+        const renderDistribution = (containerId, entries, badgeClass) => {
+            const container = modalElement.querySelector(`#${containerId}`);
+            entries.forEach(([label, count]) => {
+                const row = document.createElement('div');
+                row.className = 'd-flex justify-content-between align-items-center mb-2';
+                const name = document.createElement('span');
+                name.textContent = label;
+                const badge = document.createElement('span');
+                badge.className = `badge ${badgeClass}`;
+                badge.textContent = String(count);
+                row.append(name, badge);
+                container.appendChild(row);
+            });
+        };
+        renderDistribution('projectOsDistribution', data.os_distribution, 'bg-primary');
+        renderDistribution('projectVersionDistribution', data.version_distribution, 'bg-success');
+        modalElement.querySelector('#projectStatsUpdated').textContent = data.last_updated;
+        modalElement.querySelector('#refreshProjectStats').addEventListener('click', () => {
+            bootstrap.Modal.getInstance(modalElement).hide();
+            showProjectStats();
+        });
 
-        // 显示模态框
-        const modal = new bootstrap.Modal(document.getElementById('projectStatsModal'));
+        const modal = new bootstrap.Modal(modalElement);
         modal.show();
-
-        // 模态框关闭后移除DOM元素
-        document.getElementById('projectStatsModal').addEventListener('hidden.bs.modal', function () {
+        modalElement.addEventListener('hidden.bs.modal', function () {
             this.remove();
         });
 
@@ -10336,15 +10629,17 @@ async function loadSystemVersion() {
         document.getElementById('versionNumber').textContent = currentSystemVersion;
 
         // 获取远程版本并检查更新
-        const response = await fetch('http://xianyu.zhinianblog.cn/index.php?action=getVersion');
-        const result = await response.json();
-
+        const result = await fetchTrustedProjectJson('/index.php?action=getVersion');
         if (result.error) {
-            console.error('获取版本号失败:', result.message);
+            console.error('获取版本号失败');
             return;
         }
 
-        const remoteVersion = result.data;
+        const remoteVersion = toSafeVersion(result.data);
+        if (!remoteVersion) {
+            console.error('远程版本格式无效');
+            return;
+        }
 
         // 检查是否有更新
         if (remoteVersion !== currentSystemVersion) {
@@ -10391,16 +10686,25 @@ function showUpdateAvailable(newVersion) {
  */
 async function getUpdateInfo() {
     try {
-        const response = await fetch('http://xianyu.zhinianblog.cn/index.php?action=getUpdateInfo');
-        const result = await response.json();
-
-        if (result.error) {
-            showToast('获取更新信息失败: ' + result.message, 'danger');
+        const result = await fetchTrustedProjectJson('/index.php?action=getUpdateInfo');
+        if (result.error || !result.data || typeof result.data !== 'object' || Array.isArray(result.data)) {
+            showToast('获取更新信息失败', 'danger');
             return null;
         }
 
-        return result.data;
-
+        const version = toSafeVersion(result.data.version);
+        const updates = Array.isArray(result.data.updates)
+            ? result.data.updates.slice(0, 100).map(item => toSafeText(item, 500)).filter(Boolean)
+            : [];
+        if (!version) {
+            showToast('远程更新信息格式无效', 'danger');
+            return null;
+        }
+        return {
+            version,
+            releaseDate: toSafeText(result.data.releaseDate, 80) || '未知',
+            updates
+        };
     } catch (error) {
         console.error('获取更新信息失败:', error);
         showToast('获取更新信息失败', 'danger');
@@ -10414,11 +10718,6 @@ async function getUpdateInfo() {
 async function showUpdateInfo(newVersion) {
     const updateInfo = await getUpdateInfo();
     if (!updateInfo) return;
-
-    let updateList = '';
-    if (updateInfo.updates && updateInfo.updates.length > 0) {
-        updateList = updateInfo.updates.map(item => `<li class="mb-2">${item}</li>`).join('');
-    }
 
     const modalHtml = `
         <div class="modal fade" id="updateModal" tabindex="-1">
@@ -10438,16 +10737,16 @@ async function showUpdateInfo(newVersion) {
                         <div class="row mb-3">
                             <div class="col-md-6">
                                 <h6><i class="bi bi-tag me-1"></i>最新版本</h6>
-                                <p class="fs-4 text-success fw-bold">${updateInfo.version}</p>
+                                <p class="fs-4 text-success fw-bold" id="updateVersion"></p>
                             </div>
                             <div class="col-md-6">
                                 <h6><i class="bi bi-calendar me-1"></i>发布日期</h6>
-                                <p class="text-muted">${updateInfo.releaseDate || '未知'}</p>
+                                <p class="text-muted" id="updateReleaseDate"></p>
                             </div>
                         </div>
                         <hr>
                         <h6><i class="bi bi-list-ul me-1"></i>更新内容</h6>
-                        ${updateList ? `<ul class="list-unstyled ps-3">${updateList}</ul>` : '<p class="text-muted">暂无更新内容</p>'}
+                        <div id="updateItems"></div>
                     </div>
                     <div class="modal-footer">
                         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
@@ -10463,12 +10762,34 @@ async function showUpdateInfo(newVersion) {
         existingModal.remove();
     }
 
-    // 添加新的模态框
+    // 添加新的模态框。远程更新内容只通过 textContent 写入。
     document.body.insertAdjacentHTML('beforeend', modalHtml);
+    const modalElement = document.getElementById('updateModal');
+    modalElement.querySelector('#updateVersion').textContent = updateInfo.version;
+    modalElement.querySelector('#updateReleaseDate').textContent = updateInfo.releaseDate;
+    const updateItems = modalElement.querySelector('#updateItems');
+    if (updateInfo.updates.length) {
+        const list = document.createElement('ul');
+        list.className = 'list-unstyled ps-3';
+        updateInfo.updates.forEach(item => {
+            const listItem = document.createElement('li');
+            listItem.className = 'mb-2';
+            listItem.textContent = item;
+            list.appendChild(listItem);
+        });
+        updateItems.appendChild(list);
+    } else {
+        const empty = document.createElement('p');
+        empty.className = 'text-muted';
+        empty.textContent = '暂无更新内容';
+        updateItems.appendChild(empty);
+    }
 
-    // 显示模态框
-    const modal = new bootstrap.Modal(document.getElementById('updateModal'));
+    const modal = new bootstrap.Modal(modalElement);
     modal.show();
+    modalElement.addEventListener('hidden.bs.modal', function () {
+        this.remove();
+    });
 }
 
 // ==================== AI 回复设置独立面板 ====================

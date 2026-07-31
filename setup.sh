@@ -34,21 +34,37 @@ if [ ! -f ".env" ]; then
     echo "  [重要] 请编辑 .env 填入必填项后重新运行本脚本:"
     echo "    nano .env"
     echo
-    echo "  必填: DEEPSEEK_API_KEY / ADMIN_USERNAME / ADMIN_PASSWORD / JWT_SECRET_KEY"
-    echo "  可选: LM_STUDIO_URL (远程图片理解模型地址)"
-    exit 0
+    echo "  必填: DASHSCOPE_API_KEY / ADMIN_USERNAME / ADMIN_PASSWORD / XIANYU_MESSAGE_API_KEY"
+    echo "  AI 回复: DEEPSEEK_API_KEY 仅作部署配置，仍需在管理后台保存并启用账号设置"
+    echo "  图片描述: 仅使用阿里云百炼千问 API"
+    exit 2
 else
     ok ".env 已存在"
 fi
 
+# Linux bind mount 必须与容器固定 UID/GID 匹配。
+if [ "$OS_TYPE" = "linux" ]; then
+    mkdir -p data logs backups static/uploads/images
+    if [ "$(id -u)" -eq 0 ]; then
+        chown -R 10001:10001 data logs backups static/uploads/images
+        chmod 0750 data logs backups static/uploads/images
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo chown -R 10001:10001 data logs backups static/uploads/images
+        sudo chmod 0750 data logs backups static/uploads/images
+    else
+        err "需要 root 权限将 data/logs/backups/static/uploads/images 设置为 10001:10001"
+    fi
+    ok "持久化与上传目录权限已设置为 10001:10001 / 0750"
+fi
+
 # [3/6] 拉取镜像
 echo; echo "[3/6] 拉取 Docker 镜像..."
-docker-compose pull 2>/dev/null || warn "部分镜像拉取失败，将尝试构建"
+docker compose pull 2>/dev/null || warn "部分镜像拉取失败，将尝试构建"
 ok "镜像就绪"
 
 # [4/6] 启动 CookieCloud
 echo; echo "[4/6] 启动内置 CookieCloud..."
-docker-compose up -d cookiecloud 2>/dev/null && ok "CookieCloud 已启动 (端口 8088)" || warn "CookieCloud 启动失败"
+docker compose up -d cookiecloud 2>/dev/null && ok "CookieCloud 已启动 (端口 8088)" || warn "CookieCloud 启动失败"
 
 # [5/6] 浏览器引导
 echo; echo "[5/6] 浏览器引导..."
@@ -66,7 +82,8 @@ read -p "  完成后按 Enter 继续..." _
 
 # [6/6] 启动全部服务
 echo; echo "[6/6] 启动全部服务..."
-docker-compose up -d 2>/dev/null && ok "全部服务已启动" || warn "部分服务启动失败"
+docker compose up -d --wait --wait-timeout 180 || err "核心服务未在 180 秒内达到健康状态，请根据上方错误修复配置后重试"
+ok "全部核心服务已启动并通过健康检查"
 
 # 开机自启
 echo
@@ -85,7 +102,8 @@ if [ "$STARTUP_MODE" = "auto" ]; then
     <string>com.xianyu.ai</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/docker-compose</string>
+        <string>/usr/local/bin/docker</string>
+        <string>compose</string>
         <string>up</string>
         <string>-d</string>
     </array>
@@ -115,8 +133,8 @@ Requires=docker.service
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=$(pwd)
-ExecStart=/usr/bin/docker-compose up -d
-ExecStop=/usr/bin/docker-compose down
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
 User=root
 
 [Install]
@@ -137,6 +155,6 @@ echo "  🎉 部署完成！"
 echo "============================================="
 echo
 echo "  管理后台: http://localhost:8080"
-echo "  停止系统: docker-compose down"
-echo "  查看日志: docker-compose logs -f"
+echo "  停止系统: docker compose down"
+echo "  查看日志: docker compose logs -f"
 echo

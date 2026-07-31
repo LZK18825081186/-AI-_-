@@ -1,16 +1,23 @@
 #!/bin/bash
+set -Eeuo pipefail
 
-echo "Starting xianyu-auto-reply system..."
+readonly WRITABLE_DIRS=(
+    /app/data
+    /app/logs
+    /app/backups
+    /app/static/uploads/images
+)
 
-# Create necessary directories
-mkdir -p /app/data /app/logs /app/backups /app/static/uploads/images
+printf 'Starting xianyu-auto-reply system as uid=%s gid=%s...\n' "$(id -u)" "$(id -g)"
 
-# Clean up old logs (keep 7 days)
-find /app/logs -name "*.log" -mtime +7 -delete 2>/dev/null
-echo "Log cleanup done (kept last 7 days)"
+for directory in "${WRITABLE_DIRS[@]}"; do
+    mkdir -p "${directory}"
+    test -w "${directory}" || {
+        printf 'ERROR: required directory is not writable: %s\n' "${directory}" >&2
+        exit 1
+    }
+done
 
-# Set permissions
-chmod 777 /app/data /app/logs /app/backups /app/static/uploads /app/static/uploads/images
+find /app/logs -type f -name "*.log" -mtime +7 -delete 2>/dev/null || true
 
-# Start the application
 exec python Start.py

@@ -17,11 +17,15 @@ class SecureFreeshipping:
         self.token_refresh_interval = None
 
     def _safe_str(self, obj):
-        """安全转换为字符串"""
-        try:
-            return str(obj)
-        except:
-            return "无法转换的对象"
+        """仅返回异常类型，避免异常文本携带请求参数或响应正文。"""
+        return type(obj).__name__
+
+    @staticmethod
+    def _mask_id(value):
+        text = str(value or "")
+        if len(text) <= 4:
+            return "***"
+        return f"{text[:2]}***{text[-2:]}"
 
     async def update_config_cookies(self):
         """更新数据库中的cookies"""
@@ -64,23 +68,24 @@ class SecureFreeshipping:
             'data': data_val,
         }
         
-        # 打印参数信息
-        logger.info(f"【{self.cookie_id}】免拼发货请求参数: data_val = {data_val}")
-        logger.info(f"【{self.cookie_id}】参数详情 - order_id: {order_id}, item_id: {item_id}, buyer_id: {buyer_id}")
+        logger.info(
+            f"【{self.cookie_id}】准备免拼发货: "
+            f"order_id={self._mask_id(order_id)}, item_id={self._mask_id(item_id)}"
+        )
 
         # 始终从最新的cookies中获取_m_h5_tk token（刷新后cookies会被更新）
         token = trans_cookies(self.cookies_str).get('_m_h5_tk', '').split('_')[0] if trans_cookies(self.cookies_str).get('_m_h5_tk') else ''
 
         if token:
-            logger.info(f"使用cookies中的_m_h5_tk token: {token}")
+            logger.debug("Cookie 签名 Token 可用")
         else:
-            logger.warning("cookies中没有找到_m_h5_tk token")
+            logger.warning("Cookie 中没有找到签名 Token")
 
         sign = generate_sign(params['t'], token, data_val)
         params['sign'] = sign
 
         try:
-            logger.info(f"【{self.cookie_id}】开始自动免拼发货，订单ID: {order_id}")
+            logger.info(f"【{self.cookie_id}】开始自动免拼发货，订单ID: {self._mask_id(order_id)}")
             async with self.session.post(
                 'https://h5api.m.goofish.com/h5/mtop.idle.groupon.activity.seller.freeshipping/1.0/',
                 params=params,
@@ -105,15 +110,18 @@ class SecureFreeshipping:
                         await self.update_config_cookies()
                         logger.debug("已更新Cookie到数据库")
 
-                logger.info(f"【{self.cookie_id}】自动免拼发货响应: {res_json}")
+                ret_code = res_json.get('ret', ['UNKNOWN'])[0] if res_json.get('ret') else 'UNKNOWN'
+                logger.info(
+                    f"【{self.cookie_id}】自动免拼发货响应已解析: "
+                    f"http_status={response.status}, success={ret_code == 'SUCCESS::调用成功'}"
+                )
                 
                 # 检查响应结果
                 if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
-                    logger.info(f"【{self.cookie_id}】✅ 自动免拼发货成功，订单ID: {order_id}")
+                    logger.info(f"【{self.cookie_id}】✅ 自动免拼发货成功，订单ID: {self._mask_id(order_id)}")
                     return {"success": True, "order_id": order_id}
                 else:
-                    error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
-                    logger.warning(f"【{self.cookie_id}】❌ 自动免拼发货失败: {error_msg}")
+                    logger.warning(f"【{self.cookie_id}】❌ 自动免拼发货失败: api_ret_present={bool(res_json.get('ret'))}")
                     
                     return await self.auto_freeshipping(order_id, item_id, buyer_id, retry_count + 1)
                     

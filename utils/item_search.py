@@ -57,13 +57,12 @@ class XianyuSearcher:
                 return default
         return data
 
-    async def get_first_valid_cookie(self):
-        """获取第一个有效的cookie"""
+    async def get_first_valid_cookie(self, user_id: int):
+        """仅从当前用户的账号中获取第一个有效 Cookie。"""
         try:
             from db_manager import db_manager
 
-            # 获取所有cookies，返回格式是 {id: value}
-            cookies = db_manager.get_all_cookies()
+            cookies = db_manager.get_all_cookies(user_id)
 
             # 找到第一个有效的cookie（长度大于50的认为是有效的）
             for cookie_id, cookie_value in cookies.items():
@@ -160,7 +159,7 @@ class XianyuSearcher:
             self.context = None
             self.page = None
     
-    async def search_items(self, keyword: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+    async def search_items(self, keyword: str, user_id: int, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         """
         搜索闲鱼商品 - 使用 Playwright 获取真实数据
 
@@ -227,7 +226,7 @@ class XianyuSearcher:
             try:
                 # 获取并设置cookies进行登录
                 logger.info("正在获取有效的cookies账户...")
-                cookie_data = await self.get_first_valid_cookie()
+                cookie_data = await self.get_first_valid_cookie(user_id)
                 if not cookie_data:
                     raise Exception("未找到有效的cookies账户，请先在Cookie管理中添加有效的闲鱼账户")
 
@@ -541,7 +540,7 @@ class XianyuSearcher:
         except Exception as e:
             logger.error(f"导航到第 {target_page} 页失败: {str(e)}")
 
-    async def search_multiple_pages(self, keyword: str, total_pages: int = 1) -> Dict[str, Any]:
+    async def search_multiple_pages(self, keyword: str, user_id: int, total_pages: int = 1) -> Dict[str, Any]:
         """
         搜索多页闲鱼商品
 
@@ -620,7 +619,7 @@ class XianyuSearcher:
 
                 # 获取并设置cookies进行登录
                 logger.info("正在获取有效的cookies账户...")
-                cookie_data = await self.get_first_valid_cookie()
+                cookie_data = await self.get_first_valid_cookie(user_id)
                 if not cookie_data:
                     raise Exception("未找到有效的cookies账户，请先在Cookie管理中添加有效的闲鱼账户")
 
@@ -874,7 +873,7 @@ class XianyuSearcher:
 
 # 搜索器工具函数
 
-async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+async def search_xianyu_items(keyword: str, user_id: int, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
     """
     搜索闲鱼商品的便捷函数，带重试机制
 
@@ -896,7 +895,7 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
             searcher = XianyuSearcher()
 
             logger.info(f"开始单页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
-            result = await searcher.search_items(keyword, page, page_size)
+            result = await searcher.search_items(keyword, user_id, page, page_size)
 
             # 如果成功获取到数据，直接返回
             if result.get('items') or not result.get('error'):
@@ -935,7 +934,7 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
     }
 
 
-async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Dict[str, Any]:
+async def search_multiple_pages_xianyu(keyword: str, user_id: int, total_pages: int = 1) -> Dict[str, Any]:
     """
     搜索多页闲鱼商品的便捷函数，带重试机制
 
@@ -956,7 +955,7 @@ async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Di
             searcher = XianyuSearcher()
 
             logger.info(f"开始多页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
-            result = await searcher.search_multiple_pages(keyword, total_pages)
+            result = await searcher.search_multiple_pages(keyword, user_id, total_pages)
 
             # 如果成功获取到数据，直接返回
             if result.get('items') or not result.get('error'):

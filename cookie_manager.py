@@ -17,28 +17,30 @@ class CookieManager:
         self.keywords: Dict[str, List[Tuple[str, str]]] = {}
         self.cookie_status: Dict[str, bool] = {}  # 账号启用状态
         self.auto_confirm_settings: Dict[str, bool] = {}  # 自动确认发货设置
+        self._lifecycle_lock = asyncio.Lock()
+        self._runtime_paused = False
         self._load_from_db()
 
-    def _load_from_db(self):
+    def _load_from_db(self, raise_errors: bool = False):
         """从数据库加载所有Cookie、关键字和状态"""
         try:
-            # 加载所有Cookie
-            self.cookies = db_manager.get_all_cookies()
-            # 加载所有关键字
-            self.keywords = db_manager.get_all_keywords()
-            # 加载所有Cookie状态（默认启用）
-            self.cookie_status = db_manager.get_all_cookie_status()
-            # 加载所有auto_confirm设置
-            self.auto_confirm_settings = {}
-            for cookie_id in self.cookies.keys():
-                # 为没有状态记录的Cookie设置默认启用状态
-                if cookie_id not in self.cookie_status:
-                    self.cookie_status[cookie_id] = True
-                # 加载auto_confirm设置
-                self.auto_confirm_settings[cookie_id] = db_manager.get_auto_confirm(cookie_id)
+            cookies = db_manager.get_all_cookies()
+            keywords = db_manager.get_all_keywords()
+            cookie_status = db_manager.get_all_cookie_status()
+            auto_confirm_settings = {}
+            for cookie_id in cookies:
+                cookie_status.setdefault(cookie_id, True)
+                auto_confirm_settings[cookie_id] = db_manager.get_auto_confirm(cookie_id)
+
+            self.cookies = cookies
+            self.keywords = keywords
+            self.cookie_status = cookie_status
+            self.auto_confirm_settings = auto_confirm_settings
             logger.info(f"从数据库加载了 {len(self.cookies)} 个Cookie、{len(self.keywords)} 组关键字、{len(self.cookie_status)} 个状态记录和 {len(self.auto_confirm_settings)} 个自动确认设置")
         except Exception as e:
             logger.error(f"从数据库加载数据失败: {e}")
+            if raise_errors:
+                raise
 
     def reload_from_db(self):
         """重新从数据库加载所有数据（用于备份导入后刷新）"""
@@ -56,6 +58,81 @@ class CookieManager:
         return True
 
     # ------------------------ 内部协程 ------------------------
+    async def _shutdown_registered_instances(self):
+        from XianyuAutoAsync import XianyuLive
+
+        instances = list(XianyuLive.get_all_instances().values())
+        if not instances:
+            return
+        results = await asyncio.gather(
+            *(instance.shutdown() for instance in instances),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, Exception)]
+        if failures:
+            raise RuntimeError(f"有 {len(failures)} 个闲鱼运行实例无法安全停止")
+
+    async def stop_runtime(self):
+        """在主事件循环中原子停止并等待全部账号任务。"""
+        async with self._lifecycle_lock:
+            self._runtime_paused = True
+            shutdown_error = None
+            try:
+                await self._shutdown_registered_instances()
+            except Exception as exc:
+                shutdown_error = exc
+
+            tasks = list(self.tasks.values())
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self.tasks.clear()
+
+            # 任务取消期间可能刚完成实例注册，确保没有旧实例越过恢复边界。
+            try:
+                await self._shutdown_registered_instances()
+            except Exception as exc:
+                shutdown_error = shutdown_error or exc
+            if shutdown_error:
+                raise shutdown_error
+
+    async def reload_runtime_from_db(self):
+        """在主事件循环中重载当前数据库，并启动其中启用的账号。"""
+        async with self._lifecycle_lock:
+            if self.tasks:
+                raise RuntimeError("重载数据库前必须先停止全部账号任务")
+            self._load_from_db(raise_errors=True)
+            for cookie_id, cookie_value in self.cookies.items():
+                if not self.cookie_status.get(cookie_id, True):
+                    continue
+                cookie_info = db_manager.get_cookie_details(cookie_id)
+                user_id = cookie_info.get('user_id') if cookie_info else None
+                self.tasks[cookie_id] = self.loop.create_task(
+                    self._run_xianyu(cookie_id, cookie_value, user_id)
+                )
+            self._runtime_paused = False
+            logger.info(f"数据库运行时重载完成，已启动 {len(self.tasks)} 个启用账号")
+
+    async def _run_on_manager_loop(self, coroutine):
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is self.loop:
+            return await coroutine
+        future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        return await asyncio.wrap_future(future)
+
+    async def stop_runtime_threadsafe(self):
+        """从 FastAPI 等其他事件循环安全停止主循环中的账号运行时。"""
+        return await self._run_on_manager_loop(self.stop_runtime())
+
+    async def reload_runtime_from_db_threadsafe(self):
+        """从其他事件循环安全重载主循环中的账号运行时。"""
+        return await self._run_on_manager_loop(self.reload_runtime_from_db())
+
     async def _run_xianyu(self, cookie_id: str, cookie_value: str, user_id: int = None):
         """在事件循环中启动 XianyuLive.main"""
         logger.info(f"【{cookie_id}】_run_xianyu方法开始执行...")

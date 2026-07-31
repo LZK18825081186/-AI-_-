@@ -5,24 +5,52 @@ AI回复引擎模块
 
 import os
 import json
+import tempfile
+import threading
 import time
-import sqlite3
+from io import BytesIO
+
 import requests
+from PIL import Image, ImageOps
 from typing import List, Dict, Optional
 from loguru import logger
 from openai import OpenAI
 from db_manager import db_manager
 
-# 本地/远程 LM Studio 地址（通过环境变量切换）
-LM_STUDIO_URL = os.environ.get("LM_STUDIO_URL", "http://localhost:1234")
-# 飞书多维表格访问凭证（必须通过 .env 或环境变量配置）
+# 商品图片理解统一使用阿里云百炼千问视觉 API，T730 不运行本地视觉模型。
+DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "").strip()
+QWEN_API_BASE_URL = os.environ.get(
+    "QWEN_API_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+).rstrip("/")
+QWEN_VL_MODEL = os.environ.get("QWEN_VL_MODEL", "qwen-vl-plus").strip()
+QWEN_TEXT_MODEL = os.environ.get("QWEN_TEXT_MODEL", "qwen-plus").strip()
+QWEN_REQUEST_TIMEOUT = float(os.environ.get("QWEN_REQUEST_TIMEOUT", "60"))
+QWEN_MAX_RETRIES = max(0, min(3, int(os.environ.get("QWEN_MAX_RETRIES", "2"))))
+QWEN_MAX_IMAGE_BYTES = max(
+    256 * 1024, int(os.environ.get("QWEN_MAX_IMAGE_BYTES", str(4 * 1024 * 1024)))
+)
+QWEN_MAX_IMAGE_DIMENSION = max(
+    512, int(os.environ.get("QWEN_MAX_IMAGE_DIMENSION", "2048"))
+)
+QWEN_MAX_PRODUCT_IMAGES = max(1, min(12, int(os.environ.get("QWEN_MAX_PRODUCT_IMAGES", "6"))))
+DB_PATH = os.environ.get("DB_PATH", "xianyu_data.db").strip() or "xianyu_data.db"
+AI_CACHE_DIR = os.environ.get("AI_CACHE_DIR", "").strip() or os.path.dirname(
+    os.path.abspath(DB_PATH)
+)
+# 飞书库存数据必须经由宿主机桥接服务读取。桥接服务会先验证群聊中的
+# 文件消息，再读取该消息指向的实时 Base，容器不保存飞书用户凭据。
 FEISHU_BASE_TOKEN = os.environ.get("FEISHU_BASE_TOKEN", "")
 FEISHU_TABLE_ID = os.environ.get("FEISHU_TABLE_ID", "")
+FEISHU_INVENTORY_BRIDGE_URL = os.environ.get("FEISHU_INVENTORY_BRIDGE_URL", "").rstrip("/")
+FEISHU_INVENTORY_BRIDGE_TOKEN = os.environ.get("FEISHU_INVENTORY_BRIDGE_TOKEN", "")
+
 
 def _ensure_feishu_config():
-    """惰性检查：只在首次调用飞书 API 时才触发，不阻塞模块 import"""
-    if not FEISHU_BASE_TOKEN or not FEISHU_TABLE_ID:
-        raise RuntimeError("请设置 FEISHU_BASE_TOKEN 和 FEISHU_TABLE_ID 环境变量（在 .env 或系统环境变量中配置）")
+    """检查群文件库存桥接配置。"""
+    if not FEISHU_INVENTORY_BRIDGE_URL or not FEISHU_INVENTORY_BRIDGE_TOKEN:
+        raise RuntimeError(
+            "请设置 FEISHU_INVENTORY_BRIDGE_URL 和 FEISHU_INVENTORY_BRIDGE_TOKEN"
+        )
 
 
 class AIReplyEngine:
@@ -32,81 +60,116 @@ class AIReplyEngine:
         self.clients = {}  # 存储不同账号的OpenAI客户端
         self.agents = {}   # 存储不同账号的Agent实例
         self.item_images = {}  # 商品图片缓存: {商品名: [{file_token, name, cdn_url}]}
-        self.image_cdn_cache_path = os.path.join(os.path.dirname(__file__), 'image_cdn_cache.json')
-        self.image_descriptions_path = os.path.join(os.path.dirname(__file__), 'image_descriptions.json')
+        self.image_cdn_cache_path = os.path.join(AI_CACHE_DIR, 'image_cdn_cache.json')
+        self.image_descriptions_path = os.path.join(AI_CACHE_DIR, 'image_descriptions.json')
         self.vl_config_cache = None  # VL模型配置缓存
+        self.inventory_records = []
+        self.inventory_source = None
+        self.inventory_loaded_at = 0.0
+        self.inventory_lock = threading.RLock()
+        self.cache_lock = threading.RLock()
         self._load_image_cdn_cache()
         self._load_image_descriptions()
         self._init_default_prompts()
         self._start_auto_sync_timer()
     
     def _start_auto_sync_timer(self):
-        """启动后台定时器，每5分钟检查飞书新图片并自动生成描述"""
-        _ensure_feishu_config()
+        """定时预热飞书群文件库存，失败时保持 fail-closed。"""
+        try:
+            _ensure_feishu_config()
+        except RuntimeError as exc:
+            logger.warning(f"飞书群文件库存桥接未配置: {type(exc).__name__}")
+            return
+
         import threading
-        base_token = FEISHU_BASE_TOKEN
-        table_id = FEISHU_TABLE_ID
-        
+
         def _timer_loop():
             while True:
                 try:
-                    self._sync_images_only(base_token, table_id)
-                except Exception as e:
-                    logger.debug(f"定时同步异常: {e}")
-                time.sleep(300)  # 5分钟
-        
+                    self._load_knowledge_base(force_refresh=True)
+                except Exception as exc:
+                    logger.warning(f"飞书群文件库存定时同步失败: {type(exc).__name__}")
+                time.sleep(300)
+
         t = threading.Thread(target=_timer_loop, daemon=True)
         t.start()
-        logger.info("后台图片同步定时器已启动（每5分钟检查一次）")
+        logger.info("飞书群文件库存同步定时器已启动（每5分钟验证一次）")
     
+    @staticmethod
+    def _atomic_write_json(path: str, payload: dict) -> None:
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=".cache-", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                json.dump(payload, output, ensure_ascii=False, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temp_path, path)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
+
     def _load_image_cdn_cache(self):
-        """加载图片CDN URL缓存"""
+        """加载图片 CDN URL 缓存。"""
         try:
-            if os.path.exists(self.image_cdn_cache_path):
-                with open(self.image_cdn_cache_path, 'r', encoding='utf-8') as f:
-                    cached = json.load(f)
-                # 合并到 item_images
-                for name, imgs in cached.items():
-                    if name in self.item_images:
-                        for i, img in enumerate(self.item_images[name]):
-                            if i < len(imgs) and 'cdn_url' in imgs[i]:
-                                img['cdn_url'] = imgs[i]['cdn_url']
-                    else:
-                        self.item_images[name] = imgs
-                logger.info(f"图片CDN缓存已加载: {len(cached)} 个商品")
-        except Exception as e:
-            logger.warning(f"加载图片CDN缓存失败: {e}")
-    
+            with self.cache_lock:
+                if not os.path.exists(self.image_cdn_cache_path):
+                    return
+                with open(self.image_cdn_cache_path, "r", encoding="utf-8") as cache_file:
+                    cached = json.load(cache_file)
+                if not isinstance(cached, dict):
+                    raise ValueError("invalid media cache")
+                self.item_images = cached
+            logger.info(f"图片CDN缓存已加载: {len(cached)} 个商品")
+        except Exception as exc:
+            logger.warning(f"加载图片CDN缓存失败: {type(exc).__name__}")
+
     def _save_image_cdn_cache(self):
-        """保存图片CDN URL缓存"""
+        """以原子替换保存图片 CDN URL 缓存。"""
         try:
-            cached = {}
-            for name, imgs in self.item_images.items():
-                cached[name] = [{'cdn_url': img.get('cdn_url'), 'file_token': img.get('file_token'), 'name': img.get('name'), 'record_id': img.get('record_id')} for img in imgs]
-            with open(self.image_cdn_cache_path, 'w', encoding='utf-8') as f:
-                json.dump(cached, f, ensure_ascii=False)
-            logger.debug(f"图片CDN缓存已保存")
-        except Exception as e:
-            logger.warning(f"保存图片CDN缓存失败: {e}")
+            with self.cache_lock:
+                cached = {
+                    name: [
+                        {
+                            "cdn_url": image.get("cdn_url"),
+                            "file_token": image.get("file_token"),
+                            "name": image.get("name"),
+                            "record_id": image.get("record_id"),
+                        }
+                        for image in images
+                    ]
+                    for name, images in self.item_images.items()
+                }
+                self._atomic_write_json(self.image_cdn_cache_path, cached)
+            logger.debug("图片CDN缓存已保存")
+        except Exception as exc:
+            logger.warning(f"保存图片CDN缓存失败: {type(exc).__name__}")
 
     def _load_image_descriptions(self):
-        """加载图片描述缓存"""
+        """加载图片描述缓存。"""
         try:
-            if os.path.exists(self.image_descriptions_path):
-                with open(self.image_descriptions_path, 'r', encoding='utf-8') as f:
-                    self.image_descriptions = json.load(f)
-            else:
-                self.image_descriptions = {}
-        except Exception:
+            with self.cache_lock:
+                if not os.path.exists(self.image_descriptions_path):
+                    self.image_descriptions = {}
+                    return
+                with open(self.image_descriptions_path, "r", encoding="utf-8") as cache_file:
+                    cached = json.load(cache_file)
+                self.image_descriptions = cached if isinstance(cached, dict) else {}
+        except Exception as exc:
+            logger.warning(f"加载图片描述缓存失败: {type(exc).__name__}")
             self.image_descriptions = {}
 
     def _save_image_descriptions(self):
-        """保存图片描述缓存"""
+        """以原子替换保存图片描述缓存。"""
         try:
-            with open(self.image_descriptions_path, 'w', encoding='utf-8') as f:
-                json.dump(self.image_descriptions, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"保存图片描述缓存失败: {e}")
+            with self.cache_lock:
+                self._atomic_write_json(self.image_descriptions_path, self.image_descriptions)
+        except Exception as exc:
+            logger.warning(f"保存图片描述缓存失败: {type(exc).__name__}")
 
     def _sync_images_only(self, base_token: str, table_id: str):
         """仅同步图片数据（轻量，不写 knowledge_base.txt）"""
@@ -178,10 +241,10 @@ class AIReplyEngine:
                 # 自动检测新图片并生成描述
                 self._auto_generate_new_descriptions()
         except Exception as e:
-            logger.debug(f"图片同步失败(非关键): {e}")
+            logger.debug(f"图片同步失败(非关键): {type(e).__name__}")
 
     def _auto_generate_new_descriptions(self):
-        """自动检测飞书表格中新增的图片，调用本地VL模型生成描述"""
+        """自动检测飞书表格新增图片，调用千问视觉 API 生成描述。"""
         import threading
         
         def _do_generate():
@@ -349,14 +412,17 @@ class AIReplyEngine:
                 return None
             
             try:
-                logger.info(f"创建OpenAI客户端 {cookie_id}: base_url={settings['base_url']}, api_key={'***' + settings['api_key'][-4:] if settings['api_key'] else 'None'}")
+                logger.info(
+                    f"创建OpenAI客户端 {cookie_id}: base_url={settings['base_url']}, "
+                    f"api_key_configured={bool(settings['api_key'])}"
+                )
                 self.clients[cookie_id] = OpenAI(
                     api_key=settings['api_key'],
                     base_url=settings['base_url']
                 )
                 logger.info(f"为账号 {cookie_id} 创建OpenAI客户端成功，实际base_url: {self.clients[cookie_id].base_url}")
             except Exception as e:
-                logger.error(f"创建OpenAI客户端失败 {cookie_id}: {e}")
+                logger.error(f"创建OpenAI客户端失败 {cookie_id}: {type(e).__name__}")
                 return None
         
         return self.clients[cookie_id]
@@ -377,8 +443,252 @@ class AIReplyEngine:
                 return p
         return 'lark-cli'
 
-    def _load_knowledge_base(self) -> str:
-        """从飞书多维表格同步库存数据到本地缓存，返回知识库内容"""
+    @staticmethod
+    def _scalar(value):
+        if isinstance(value, list):
+            return value[0] if value else ""
+        return value if value is not None else ""
+
+    @classmethod
+    def _inventory_int(cls, value) -> int:
+        try:
+            return max(0, int(float(cls._scalar(value) or 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _size_label(size: str) -> str:
+        size = size.strip()
+        if not size:
+            return ""
+        return size if size.endswith("码") else f"{size}码"
+
+    def _fetch_group_inventory(self) -> dict:
+        """从桥接服务读取经过群消息验证的实时库存。"""
+        _ensure_feishu_config()
+        response = requests.get(
+            f"{FEISHU_INVENTORY_BRIDGE_URL}/inventory",
+            headers={"Authorization": f"Bearer {FEISHU_INVENTORY_BRIDGE_TOKEN}"},
+            timeout=35,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"飞书库存桥接返回 HTTP {response.status_code}")
+        payload = response.json()
+        if payload.get("ok") is not True or payload.get("source_verified") is not True:
+            raise RuntimeError("飞书群聊文件来源未通过验证")
+        records = payload.get("records")
+        if not isinstance(records, list):
+            raise RuntimeError("飞书库存记录格式无效")
+        return payload
+
+    def _sync_media_from_verified_records(self) -> None:
+        """从已验证的桥接记录更新媒体和人工审核描述缓存。"""
+        new_item_images = {}
+        description_states = {}
+        for record in self.inventory_records:
+            name = str(self._scalar(record.get("角色名称"))).strip()
+            if not name:
+                continue
+            images = record.get("实物图")
+            if isinstance(images, list):
+                media = []
+                for image in images:
+                    if not isinstance(image, dict) or not image.get("file_token"):
+                        continue
+                    previous_url = next(
+                        (
+                            item.get("cdn_url")
+                            for item in self.item_images.get(name, [])
+                            if item.get("file_token") == image.get("file_token")
+                        ),
+                        None,
+                    )
+                    media.append(
+                        {
+                            "file_token": image["file_token"],
+                            "name": image.get("name", ""),
+                            "cdn_url": previous_url,
+                            "record_id": record.get("_record_id"),
+                        }
+                    )
+                if media:
+                    new_item_images.setdefault(name, []).extend(media)
+            description = str(self._scalar(record.get("图片描述"))).strip()
+            reviewed = str(self._scalar(record.get("描述已审核"))).lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+            description_states.setdefault(name, []).append((description, reviewed))
+
+        reviewed_descriptions = {}
+        for name, states in description_states.items():
+            descriptions = {description for description, _ in states if description}
+            if (
+                len(descriptions) == 1
+                and all(description and reviewed for description, reviewed in states)
+            ):
+                reviewed_descriptions[name] = descriptions.pop()
+
+        with self.cache_lock:
+            self.item_images = new_item_images
+            # 整批重建，确保撤审、描述删除或商品删除会同步清除旧客服事实。
+            self.image_descriptions = {}
+            for name, description in reviewed_descriptions.items():
+                self.image_descriptions[name] = [
+                    {
+                        "file_token": "__VERIFIED__",
+                        "name": f"{name}_verified",
+                        "description": description,
+                        "reviewed": True,
+                        "is_unified": True,
+                    }
+                ]
+            self._save_image_cdn_cache()
+            self._save_image_descriptions()
+
+    def _load_knowledge_base(self, force_refresh: bool = False) -> str:
+        """验证群聊文件并读取实时 Base；禁止使用本地旧库存兜底。"""
+        with self.inventory_lock:
+            payload = self._fetch_group_inventory()
+            self.inventory_records = payload["records"]
+            self.inventory_source = payload.get("source") or {}
+            self.inventory_loaded_at = time.time()
+            self._sync_media_from_verified_records()
+            records = list(self.inventory_records)
+            source_metadata = dict(self.inventory_source)
+
+        lines = ["=== 飞书群聊文件实时库存（唯一权威来源） ==="]
+        for record in records:
+            name = str(self._scalar(record.get("角色名称"))).strip()
+            if not name:
+                continue
+            work_source = str(self._scalar(record.get("作品来源"))).strip()
+            size = str(self._scalar(record.get("码数"))).strip()
+            status = str(self._scalar(record.get("状态"))).strip()
+            price = str(self._scalar(record.get("租期价格"))).strip()
+            deposit = str(self._scalar(record.get("押金"))).strip()
+            accessories = str(self._scalar(record.get("配件清单"))).strip()
+            total = self._inventory_int(record.get("总库存"))
+            rented = self._inventory_int(record.get("已租出"))
+            available = max(0, total - rented)
+            label = f"{work_source}-{name}" if work_source else name
+            size_label = self._size_label(size)
+            size_text = f" {size_label}" if size_label else ""
+            line = f"{label}{size_text}：总{total}套，可租{available}套，状态{status or '未标注'}"
+            if price:
+                line += f"，租金{price}"
+            if deposit:
+                line += f"，押金{deposit}元"
+            if accessories:
+                line += f"，配件{accessories}"
+            lines.append(line)
+
+        logger.info(
+            "飞书群聊文件库存读取成功: "
+            "source_verified=true, "
+            f"message_id={source_metadata.get('message_id')}, "
+            f"records={len(records)}"
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _requires_inventory_facts(message: str) -> bool:
+        keywords = (
+            "库存", "有哪些", "有什么", "有货", "现货", "可租", "能租", "剩", "租金",
+            "价格", "多少钱", "押金", "码数", "尺码", "配件", "包含", "归还", "状态",
+        )
+        return any(keyword in message for keyword in keywords)
+
+    def _build_verified_inventory_reply(self, message: str, item_title: str = "") -> Optional[str]:
+        """对库存事实做确定性回复，避免模型改写或编造数字。"""
+        if not self._requires_inventory_facts(message):
+            return None
+
+        with self.inventory_lock:
+            records = list(self.inventory_records)
+
+        matched_names = []
+        for record in records:
+            name = str(self._scalar(record.get("角色名称"))).strip()
+            if name and name in message and name not in matched_names:
+                matched_names.append(name)
+        if not matched_names and item_title:
+            for record in records:
+                name = str(self._scalar(record.get("角色名称"))).strip()
+                if name and name in item_title and name not in matched_names:
+                    matched_names.append(name)
+
+        if matched_names:
+            parts = []
+            for name in matched_names:
+                variants = []
+                prices = []
+                deposits = []
+                accessory_sets = []
+                for record in records:
+                    if str(self._scalar(record.get("角色名称"))).strip() != name:
+                        continue
+                    size = str(self._scalar(record.get("码数"))).strip()
+                    total = self._inventory_int(record.get("总库存"))
+                    rented = self._inventory_int(record.get("已租出"))
+                    available = max(0, total - rented)
+                    status = str(self._scalar(record.get("状态"))).strip()
+                    price = str(self._scalar(record.get("租期价格"))).strip()
+                    deposit = str(self._scalar(record.get("押金"))).strip()
+                    accessories = str(self._scalar(record.get("配件清单"))).strip()
+                    label = self._size_label(size) or "未标码"
+                    if status and status != "可租":
+                        variants.append(f"{label}{status}（暂不可租）")
+                    else:
+                        variants.append(f"{label}可租{available}套")
+                    if price and price not in prices:
+                        prices.append(price)
+                    if deposit and deposit not in deposits:
+                        deposits.append(deposit)
+                    if accessories and accessories not in accessory_sets:
+                        accessory_sets.append(accessories)
+
+                shared = []
+                if prices and any(word in message for word in ("价格", "多少钱", "租金")):
+                    shared.append("租金" + "/".join(prices))
+                if deposits and "押金" in message:
+                    shared.append("押金" + "/".join(f"{value}元" for value in deposits))
+                if accessory_sets and any(word in message for word in ("配件", "包含")):
+                    shared.append("配件" + "；".join(accessory_sets))
+                detail = "、".join(variants)
+                if shared:
+                    detail += "；" + "，".join(shared)
+                parts.append(f"{name}：{detail}")
+            reply = "飞书库存：" + "；".join(parts)
+            if len(reply) > 95:
+                reply = reply[:92].rstrip("、，；") + "…"
+            return reply
+
+        available_by_name = {}
+        for record in records:
+            name = str(self._scalar(record.get("角色名称"))).strip()
+            size = str(self._scalar(record.get("码数"))).strip()
+            total = self._inventory_int(record.get("总库存"))
+            rented = self._inventory_int(record.get("已租出"))
+            available = max(0, total - rented)
+            status = str(self._scalar(record.get("状态"))).strip()
+            if not name or available <= 0 or status != "可租":
+                continue
+            size_label = self._size_label(size)
+            label = f"{name}{size_label}" if size_label else name
+            available_by_name[label] = available_by_name.get(label, 0) + available
+
+        if not available_by_name:
+            return "我刚查了飞书库存，目前没有可租的款，具体可以帮你转人工确认。"
+        summary = "、".join(f"{name}{count}套" for name, count in available_by_name.items())
+        reply = f"我刚查了飞书库存，可租有：{summary}。"
+        if len(reply) > 95:
+            reply = reply[:92].rstrip("、，；") + "…"
+        return reply
+
+    def _load_legacy_knowledge_base(self) -> str:
+        """旧多维表直读实现，仅保留兼容代码，不用于客服回答。"""
         _ensure_feishu_config()
         kb_path = os.path.join(os.path.dirname(__file__), 'knowledge_base.txt')
         base_token = FEISHU_BASE_TOKEN
@@ -585,7 +895,7 @@ class AIReplyEngine:
                     return content
                     
         except Exception as e:
-            logger.error(f"加载知识库失败: {e}")
+            logger.error(f"加载知识库失败: {type(e).__name__}")
             # 最后兜底
             if os.path.exists(kb_path):
                 try:
@@ -682,24 +992,22 @@ class AIReplyEngine:
             "Content-Type": "application/json"
         }
 
-        logger.info(f"DashScope API请求: {url}")
-        logger.info(f"发送的prompt: {prompt}")
-        logger.debug(f"请求数据: {json.dumps(data, ensure_ascii=False)}")
+        logger.info(f"DashScope API请求: {url}, prompt_length={len(prompt)}")
 
         response = requests.post(url, headers=headers, json=data, timeout=30)
 
         if response.status_code != 200:
-            logger.error(f"DashScope API请求失败: {response.status_code} - {response.text}")
-            raise Exception(f"DashScope API请求失败: {response.status_code} - {response.text}")
+            logger.error(f"DashScope API请求失败: status_code={response.status_code}")
+            raise RuntimeError(f"DashScope API请求失败: status_code={response.status_code}")
 
         result = response.json()
-        logger.debug(f"DashScope API响应: {json.dumps(result, ensure_ascii=False)}")
+        logger.debug("DashScope API响应解析成功")
 
         # 提取回复内容
         if 'output' in result and 'text' in result['output']:
             return result['output']['text'].strip()
         else:
-            raise Exception(f"DashScope API响应格式错误: {result}")
+            raise RuntimeError("DashScope API响应格式错误")
 
     def _call_openai_api(self, client: OpenAI, settings: dict, messages: list, max_tokens: int = 100, temperature: float = 0.7) -> str:
         """调用OpenAI兼容API"""
@@ -772,12 +1080,7 @@ class AIReplyEngine:
                 return 'default'
 
         except Exception as e:
-            logger.error(f"意图检测失败 {cookie_id}: {e}")
-            # 打印更详细的错误信息
-            if hasattr(e, 'response') and hasattr(e.response, 'url'):
-                logger.error(f"请求URL: {e.response.url}")
-            if hasattr(e, 'request') and hasattr(e.request, 'url'):
-                logger.error(f"请求URL: {e.request.url}")
+            logger.error(f"意图检测失败 {cookie_id}: error_type={type(e).__name__}")
             return 'default'
 
     # ==================== 品类识别与风格切换 ====================
@@ -887,75 +1190,122 @@ class AIReplyEngine:
                     if img.get('file_token') == file_token:
                         img['cdn_url'] = cdn_url
                         self._save_image_cdn_cache()
-                        logger.info(f"图片CDN URL已缓存: {item_name}/{file_token} -> {cdn_url}")
+                        logger.info("图片CDN URL已缓存")
                         return
-        logger.warning(f"未找到要缓存的图片: {item_name}/{file_token}")
+        logger.warning("未找到要缓存的图片")
 
     def _get_accessories_by_product_name(self, product_name: str) -> str:
-        """从飞书多维表格获取商品配件清单文本"""
-        _ensure_feishu_config()
-        import subprocess, json as _json
+        """从已经过来源验证的实时记录获取配件清单。"""
         try:
-            lark_cli = self._get_lark_cli_path()
-            result = subprocess.run(
-                [lark_cli, 'base', '+record-list',
-                 '--base-token', FEISHU_BASE_TOKEN,
-                 '--table-id', FEISHU_TABLE_ID,
-                 '--as', 'user', '--limit', '200', '--json'],
-                capture_output=True, text=True, timeout=15
-            )
-            if result.returncode == 0:
-                data = _json.loads(result.stdout)
-                inner = data.get('data', {})
-                records = inner.get('data', inner.get('records', []))
-                fields = inner.get('fields', [])
-                name_idx = fields.index('角色名称') if '角色名称' in fields else -1
-                acc_idx = fields.index('配件清单') if '配件清单' in fields else -1
-                if name_idx >= 0 and acc_idx >= 0:
-                    for row in records:
-                        if row[name_idx] == product_name:
-                            acc = row[acc_idx] if acc_idx < len(row) else ''
-                            return str(acc) if acc else "（无配件清单数据）"
-        except Exception:
-            pass
-        return "（未获取到配件清单）"
+            self._load_knowledge_base(force_refresh=True)
+        except Exception as exc:
+            logger.warning(f"读取飞书配件清单失败: {type(exc).__name__}")
+            return "（未获取到配件清单）"
+        values = []
+        for record in self.inventory_records:
+            name = str(self._scalar(record.get("角色名称"))).strip()
+            accessories = str(self._scalar(record.get("配件清单"))).strip()
+            if name == product_name and accessories and accessories not in values:
+                values.append(accessories)
+        return "；".join(values) if values else "（无配件清单数据）"
 
     def _detect_vl_config(self) -> dict:
-        """探测当前加载的VL模型和可用批处理大小"""
-        import requests as _r
+        """返回千问视觉 API 配置；不探测或依赖本地模型服务。"""
+        if not DASHSCOPE_API_KEY:
+            raise RuntimeError("DASHSCOPE_API_KEY is required for image descriptions")
         if self.vl_config_cache:
             return self.vl_config_cache
-        try:
-            resp = _r.get(f"{LM_STUDIO_URL}/v1/models", timeout=5)
-            models = resp.json().get("data", [])
-            for m in models:
-                mid = m.get("id", "").lower()
-                if "qwen3.6-35b" in mid or "qwen3.6-35" in mid.replace(" ",""):
-                    cfg = {"model_id": m.get("id", mid), "max_batch": 3, "batch_size": 2,
-                           "type": "qwen3.6-35b-a3b", "reasoning": True}
-                    self.vl_config_cache = cfg; return cfg
-                if "qwen2.5-vl-72b" in mid or "qwen2.5-vl-72" in mid.replace("b",""):
-                    cfg = {"model_id": m.get("id", mid), "max_batch": 1, "batch_size": 1,
-                           "type": "qwen2.5-vl-72b"}
-                    self.vl_config_cache = cfg; return cfg
-                elif "qwen3-vl-8b" in mid:
-                    cfg = {"model_id": m.get("id", mid), "max_batch": 3, "batch_size": 2,
-                           "type": "qwen3-vl-8b"}
-                    self.vl_config_cache = cfg; return cfg
-            cfg = {"model_id": "qwen3-vl-8b-instruct", "max_batch": 3, "batch_size": 2,
-                   "type": "qwen3-vl-8b"}
-        except Exception:
-            cfg = {"model_id": "qwen3-vl-8b-instruct", "max_batch": 3, "batch_size": 2,
-                   "type": "qwen3-vl-8b"}
-        self.vl_config_cache = cfg; return cfg
+        self.vl_config_cache = {
+            "model_id": QWEN_VL_MODEL,
+            "max_batch": 3,
+            "batch_size": 2,
+            "type": "qwen-api",
+        }
+        return self.vl_config_cache
+
+    @staticmethod
+    def _qwen_client() -> OpenAI:
+        return OpenAI(
+            base_url=QWEN_API_BASE_URL,
+            api_key=DASHSCOPE_API_KEY,
+            timeout=QWEN_REQUEST_TIMEOUT,
+            max_retries=0,
+        )
+
+    @staticmethod
+    def _call_qwen_with_retry(operation, operation_name: str):
+        last_error = None
+        for attempt in range(QWEN_MAX_RETRIES + 1):
+            try:
+                return operation()
+            except Exception as exc:
+                last_error = exc
+                if attempt >= QWEN_MAX_RETRIES:
+                    break
+                delay = min(2.0, 0.5 * (2 ** attempt))
+                logger.warning(
+                    f"千问{operation_name}失败，有限重试 {attempt + 1}/{QWEN_MAX_RETRIES}: "
+                    f"{type(exc).__name__}"
+                )
+                time.sleep(delay)
+        raise last_error
+
+    @staticmethod
+    def _prepare_qwen_image(image_path: str) -> tuple[str, str]:
+        """限制像素边长和编码体积，避免把原始大图直接发送到百炼。"""
+        import base64
+
+        with Image.open(image_path) as source:
+            image = ImageOps.exif_transpose(source)
+            if image.mode not in ("RGB", "L"):
+                background = Image.new("RGB", image.size, "white")
+                if "A" in image.getbands():
+                    background.paste(image, mask=image.getchannel("A"))
+                else:
+                    background.paste(image.convert("RGB"))
+                image = background
+            else:
+                image = image.convert("RGB")
+            image.thumbnail(
+                (QWEN_MAX_IMAGE_DIMENSION, QWEN_MAX_IMAGE_DIMENSION),
+                Image.Resampling.LANCZOS,
+            )
+            quality = 88
+            while True:
+                output = BytesIO()
+                image.save(output, format="JPEG", quality=quality, optimize=True)
+                data = output.getvalue()
+                if len(data) <= QWEN_MAX_IMAGE_BYTES:
+                    return "image/jpeg", base64.b64encode(data).decode("ascii")
+                if quality > 55:
+                    quality -= 10
+                    continue
+                width, height = image.size
+                if max(width, height) <= 512:
+                    raise ValueError("image cannot be reduced below QWEN_MAX_IMAGE_BYTES")
+                image.thumbnail(
+                    (max(512, int(width * 0.75)), max(512, int(height * 0.75))),
+                    Image.Resampling.LANCZOS,
+                )
+                quality = 75
+
+    def _queue_description_manual_review(self, product_name: str, reason: str) -> None:
+        self._mark_pending_review(
+            None,
+            f"vision:{product_name}",
+            "system",
+            product_name,
+            f"商品图片描述需要人工处理：{product_name}；原因：{reason[:160]}",
+            "vision_description_failed",
+        )
 
     def _generate_image_batch(self, image_paths: list, product_name: str,
                                 batch_idx: int, accessories_ref: str,
                                 vl_cfg: dict) -> Optional[dict]:
-        """VL多图推理，输出结构化JSON"""
-        import base64, json as _json
+        """VL多图推理，输出结构化 JSON。"""
+        import json as _json
         try:
-            client = OpenAI(base_url=f"{LM_STUDIO_URL}/v1", api_key="lm-studio")
+            client = self._qwen_client()
             prompt = f"""你是一个cos服质检员，正在验收"{product_name}"的多角度实物照片。
 
 【参考配件清单】
@@ -979,19 +1329,24 @@ class AIReplyEngine:
 规则：只描述实际看到的，不确定不说。仅输出JSON，不要额外文字。"""
 
             content = [{"type": "text", "text": prompt}]
-            mime_map = {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png',
-                        'webp':'image/webp','gif':'image/gif'}
             for path in image_paths:
-                ext = path.lower().rsplit('.',1)[-1] if '.' in path else 'png'
-                mime = mime_map.get(ext, 'image/png')
-                with open(path, 'rb') as f:
-                    img_b64 = base64.b64encode(f.read()).decode()
-                content.append({"type":"image_url","image_url":{"url":f"data:{mime};base64,{img_b64}"}})
+                mime, img_b64 = self._prepare_qwen_image(path)
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{img_b64}"},
+                    }
+                )
 
-            resp = client.chat.completions.create(
-                model=vl_cfg["model_id"],
-                messages=[{"role":"user","content":content}],
-                max_tokens=600, temperature=0.3, timeout=120
+            resp = self._call_qwen_with_retry(
+                lambda: client.chat.completions.create(
+                    model=vl_cfg["model_id"],
+                    messages=[{"role": "user", "content": content}],
+                    max_tokens=600,
+                    temperature=0.3,
+                    timeout=QWEN_REQUEST_TIMEOUT,
+                ),
+                "视觉分析",
             )
             raw = resp.choices[0].message.content
             # Qwen3.6 thinking mode: fallback to reasoning_content
@@ -1004,10 +1359,10 @@ class AIReplyEngine:
             end = raw.rfind("}") + 1
             if start >= 0 and end > start:
                 return _json.loads(raw[start:end])
-            logger.warning(f"VL输出无有效JSON: {raw[:100]}")
+            logger.warning(f"VL输出无有效JSON: length={len(raw)}")
             return None
         except Exception as e:
-            logger.error(f"VL批处理失败 batch{batch_idx}: {e}")
+            logger.error(f"VL批处理失败 batch{batch_idx}: {type(e).__name__}")
             return None
 
     def _summarize_multiview(self, batch_results: list, product_name: str) -> Optional[str]:
@@ -1037,32 +1392,28 @@ class AIReplyEngine:
 
 输出格式：按【配件清单】【面料材质】【颜色还原】【做工瑕疵】【整体评价】五大段输出。每段至少2-3句，细节越多越好。不确定处标注"(以实物为准)"。"""
 
-        # 优先 DeepSeek API（更准确、更详细）
-        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
-        if deepseek_key:
-            try:
-                ds_client = OpenAI(base_url="https://api.deepseek.com", api_key=deepseek_key)
-                resp = ds_client.chat.completions.create(
-                    model="deepseek-chat", messages=[{"role":"user","content":prompt}],
-                    max_tokens=1200, temperature=0.5, timeout=90)
-                result = resp.choices[0].message.content.strip()
-                if result:
-                    logger.info(f"DeepSeek汇总 {product_name}: {len(result)}字")
-                    return result
-            except Exception as e:
-                logger.warning(f"DeepSeek汇总失败，降级本地: {e}")
-        # 降级本地模型
+        if not DASHSCOPE_API_KEY:
+            logger.error("千问 API 未配置，无法汇总商品图片描述")
+            return None
         try:
-            local = OpenAI(base_url=f"{LM_STUDIO_URL}/v1", api_key="lm-studio")
-            resp = local.chat.completions.create(
-                model="qwen3-14b", messages=[{"role":"user","content":prompt}],
-                max_tokens=1200, temperature=0.5, timeout=60)
+            qwen_client = self._qwen_client()
+            resp = self._call_qwen_with_retry(
+                lambda: qwen_client.chat.completions.create(
+                    model=QWEN_TEXT_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=1200,
+                    temperature=0.4,
+                    timeout=QWEN_REQUEST_TIMEOUT,
+                ),
+                "文本汇总",
+            )
             content = resp.choices[0].message.content
             if content:
+                logger.info(f"千问汇总完成: product={product_name}, length={len(content)}")
                 return content.strip()
         except Exception as e:
-            logger.error(f"本地汇总也失败: {e}")
-        # 最终兜底：直接拼合
+            logger.error(f"千问汇总失败: {type(e).__name__}")
+        # 最终兜底：只拼合已成功的视觉分片，不调用本地模型。
         parts = [f"【批次{r.get('batch_index',0)+1}】{r.get('findings',{}).get('overall_condition','')}"
                  for r in batch_results]
         return "\n".join(parts) if parts else None
@@ -1097,51 +1448,52 @@ class AIReplyEngine:
         return self._summarize_multiview(batch_results, product_name)
 
     def _upsert_product_description(self, product_name: str, unified_desc: str) -> int:
-        """将统一描述写入该商品所有飞书记录"""
+        """经桥接写入待审核描述，桥接强制撤销审核状态。"""
         _ensure_feishu_config()
-        import json as _json, subprocess
-        lark_cli = self._get_lark_cli_path()
-        base_token = FEISHU_BASE_TOKEN
-        table_id = FEISHU_TABLE_ID
-        record_ids = set()
-        for img in self.item_images.get(product_name, []):
-            rid = img.get('record_id')
-            if rid: record_ids.add(rid)
-        success = 0
-        for rid in record_ids:
-            try:
-                cmd = [lark_cli, 'base', '+record-upsert',
-                       '--base-token', base_token, '--table-id', table_id,
-                       '--record-id', rid,
-                       '--json', _json.dumps({'图片描述': unified_desc}, ensure_ascii=False),
-                       '--as', 'user']
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-                if r.returncode == 0: success += 1
-            except Exception as e:
-                logger.error(f"写飞书失败 record={rid}: {e}")
-        logger.info(f"统一描述写入 {product_name}: {success}/{len(record_ids)}条")
-        return success
+        record_ids = sorted(
+            {
+                image.get("record_id")
+                for image in self.item_images.get(product_name, [])
+                if image.get("record_id")
+            }
+        )
+        if not record_ids:
+            logger.warning(f"统一描述没有可写回记录: {product_name}")
+            return 0
+        try:
+            response = requests.post(
+                f"{FEISHU_INVENTORY_BRIDGE_URL}/descriptions/pending",
+                headers={
+                    "Authorization": f"Bearer {FEISHU_INVENTORY_BRIDGE_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={"record_ids": record_ids, "description": unified_desc},
+                timeout=35,
+            )
+            payload = response.json()
+            if response.status_code != 200 or payload.get("ok") is not True:
+                raise RuntimeError(f"HTTP {response.status_code}")
+            updated = int(payload.get("updated") or 0)
+            if updated != len(record_ids) or payload.get("review_required") is not True:
+                raise RuntimeError("description bridge returned incomplete update")
+            logger.info(f"待审核描述写入 {product_name}: {updated}/{len(record_ids)} 条")
+            return updated
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            logger.error(f"待审核描述写回失败: {type(exc).__name__}")
+            return 0
 
     def generate_image_description(self, image_path: str, product_name: str = "", 
                                      cookie_id: str = "default") -> Optional[str]:
-        """调用本地 VL 模型生成图片描述（自动选择最优可用模型）"""
-        import base64
+        """调用阿里云百炼千问视觉 API 生成图片描述。"""
         try:
-            mime = "image/png"
-            ext = image_path.lower().rsplit('.', 1)[-1] if '.' in image_path else 'png'
-            mime_map = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-                        'webp': 'image/webp', 'gif': 'image/gif', 'mp4': 'video/mp4'}
-            mime = mime_map.get(ext, 'image/png')
-            
-            with open(image_path, 'rb') as f:
-                img_b64 = base64.b64encode(f.read()).decode()
-            
-            # 自动检测最优 VL 模型（优先级：Qwen3.6 > Qwen2.5-VL-72B > Qwen3-VL-8B）
+            mime, img_b64 = self._prepare_qwen_image(image_path)
+
+            # 千问视觉模型由 QWEN_VL_MODEL 显式配置。
             vl_cfg = self._detect_vl_config()
             model_id = vl_cfg["model_id"]
             logger.debug(f"图片描述使用模型: {model_id}")
 
-            client = OpenAI(base_url=f"{LM_STUDIO_URL}/v1", api_key="lm-studio")
+            client = self._qwen_client()
             context = f"这是cos服\"{product_name}\"的实物图。" if product_name else ""
             prompt = f"""{context}你是一个cos服租赁店的质检员，正在验收新进的服装。请从卖家角度详细描述这张图：
 
@@ -1156,36 +1508,66 @@ class AIReplyEngine:
 
 【只描述图中实际看到的内容，不确定的不要说】"""
             
-            resp = client.chat.completions.create(
-                model=model_id,
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}}
-                ]}],
-                max_tokens=400, temperature=0.3
+            resp = self._call_qwen_with_retry(
+                lambda: client.chat.completions.create(
+                    model=model_id,
+                    messages=[{"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}}
+                    ]}],
+                    max_tokens=400,
+                    temperature=0.3,
+                    timeout=QWEN_REQUEST_TIMEOUT,
+                ),
+                "单图分析",
             )
             content = resp.choices[0].message.content
             if not content and hasattr(resp.choices[0].message, 'reasoning_content'):
                 content = resp.choices[0].message.reasoning_content or ""
             return content
         except Exception as e:
-            logger.error(f"图片描述生成失败 [{product_name}]: {e}")
+            logger.error(f"图片描述生成失败: error_type={type(e).__name__}")
             return None
 
+    def _download_verified_media_for_description(
+        self, file_token: str, output_path: str
+    ) -> bool:
+        """通过飞书桥接下载当前仍在权威 Base 中的图片。"""
+        _ensure_feishu_config()
+        try:
+            response = requests.get(
+                f"{FEISHU_INVENTORY_BRIDGE_URL}/media/{file_token}",
+                headers={"Authorization": f"Bearer {FEISHU_INVENTORY_BRIDGE_TOKEN}"},
+                timeout=45,
+            )
+            if response.status_code != 200:
+                logger.warning(f"商品描述媒体下载失败: HTTP {response.status_code}")
+                return False
+            if len(response.content) > QWEN_MAX_IMAGE_BYTES * 4:
+                logger.warning("商品描述媒体超过本地预处理上限")
+                return False
+            temp_path = f"{output_path}.part"
+            with open(temp_path, "wb") as output_file:
+                output_file.write(response.content)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+            os.replace(temp_path, output_path)
+            return True
+        except (requests.RequestException, OSError) as exc:
+            logger.warning(f"商品描述媒体下载失败: {type(exc).__name__}")
+            return False
+
     def generate_product_descriptions(self, product_name: str) -> dict:
-        """对某商品所有图片生成统一产品描述并存储"""
-        import subprocess, uuid
-        
+        """通过已验证飞书媒体与千问 API 生成待审核的统一描述。"""
+        import uuid
+
         result = {"generated": 0, "errors": [], "unified_desc": None}
         if product_name not in self.item_images:
             result["errors"].append(f"商品 {product_name} 无图片数据")
             return result
         
-        images = self.item_images[product_name]
-        lark_cli = self._get_lark_cli_path()
-        base_token = FEISHU_BASE_TOKEN
-        table_id = FEISHU_TABLE_ID
-        temp_base = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.xianyu_img_cache')
+        images = self.item_images[product_name][:QWEN_MAX_PRODUCT_IMAGES]
+        temp_base = os.path.join(AI_CACHE_DIR, '.xianyu_img_cache')
         os.makedirs(temp_base, exist_ok=True)
         
         # ---- 第1步：下载所有图片 ----
@@ -1200,13 +1582,7 @@ class AIReplyEngine:
             try:
                 output_filename = f"{uuid.uuid4().hex}_{img_name}"
                 output_path = os.path.join(temp_base, output_filename)
-                output_rel = os.path.join('.xianyu_img_cache', output_filename)
-                cmd = [lark_cli, 'base', '+record-download-attachment',
-                       '--base-token', base_token, '--table-id', table_id,
-                       '--file-token', file_token, '--output', output_rel, '--as', 'user']
-                if record_id: cmd.extend(['--record-id', record_id])
-                sub_result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                if sub_result.returncode == 0 and os.path.exists(output_path):
+                if self._download_verified_media_for_description(file_token, output_path):
                     downloaded_paths.append(output_path)
                 else:
                     result["errors"].append(f"下载失败: {img_name}")
@@ -1214,7 +1590,8 @@ class AIReplyEngine:
                 result["errors"].append(f"下载异常 {img_name}: {e}")
         
         if not downloaded_paths:
-            result["errors"].append("无图片可处理")
+            result["errors"].append("无图片可处理，已转人工")
+            self._queue_description_manual_review(product_name, "权威媒体下载失败")
             return result
         
         logger.info(f"[{product_name}] 已下载 {len(downloaded_paths)}/{len(images)} 张图片")
@@ -1232,71 +1609,107 @@ class AIReplyEngine:
             except: pass
         
         if not unified_desc:
-            result["errors"].append("统一描述生成失败")
+            result["errors"].append("统一描述生成失败，已转人工")
+            self._queue_description_manual_review(product_name, "千问视觉或汇总调用失败")
             return result
         
         result["unified_desc"] = unified_desc
         
-        # ---- 第5步：写回飞书（所有记录统一描述） ----
+        # ---- 第5步：写回飞书（所有记录统一描述，审核状态强制为 false） ----
         count = self._upsert_product_description(product_name, unified_desc)
+        if count <= 0:
+            result["errors"].append("待审核描述写回失败，已转人工")
+            self._queue_description_manual_review(product_name, "飞书待审核描述写回失败")
+            return result
         result["generated"] = count
-        
-        # ---- 第6步：更新缓存 ----
-        if product_name not in self.image_descriptions:
-            self.image_descriptions[product_name] = []
-        self.image_descriptions[product_name] = []
-        self.image_descriptions[product_name].append({
-            'file_token': '__UNIFIED__', 'name': f'{product_name}_unified',
-            'description': unified_desc, 'reviewed': False,
-            'generated_at': time.strftime('%Y-%m-%d %H:%M:%S'), 'is_unified': True
-        })
-        self._save_image_descriptions()
+
+        # ---- 第6步：只缓存待审草稿，客服上下文仅读取 reviewed=true ----
+        with self.cache_lock:
+            self.image_descriptions[product_name] = [{
+                'file_token': '__UNIFIED__', 'name': f'{product_name}_unified',
+                'description': unified_desc, 'reviewed': False,
+                'generated_at': time.strftime('%Y-%m-%d %H:%M:%S'), 'is_unified': True
+            }]
+            self._save_image_descriptions()
         
         logger.info(f"统一描述完成: {product_name} ({len(downloaded_paths)}张图→{count}条记录, {len(unified_desc)}字)")
         return result
 
     def _upsert_image_description(self, record_id: str, description: str) -> bool:
-        """将图片描述写回飞书表格"""
+        """经桥接写入单条待审核描述。"""
         _ensure_feishu_config()
-        import subprocess
-        lark_cli = self._get_lark_cli_path()
-        base_token = FEISHU_BASE_TOKEN
-        table_id = FEISHU_TABLE_ID
         try:
-            import json as _json
-            cmd = [lark_cli, 'base', '+record-upsert',
-                   '--base-token', base_token, '--table-id', table_id,
-                   '--record-id', record_id,
-                   '--json', _json.dumps({'图片描述': description}, ensure_ascii=False),
-                   '--as', 'user']
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            if result.returncode == 0:
-                return True
-            logger.error(f"写回飞书失败: {result.stderr[:200]}")
-            return False
-        except Exception as e:
-            logger.error(f"写回飞书异常: {e}")
+            response = requests.post(
+                f"{FEISHU_INVENTORY_BRIDGE_URL}/descriptions/pending",
+                headers={"Authorization": f"Bearer {FEISHU_INVENTORY_BRIDGE_TOKEN}"},
+                json={"record_ids": [record_id], "description": description},
+                timeout=35,
+            )
+            payload = response.json()
+            return (
+                response.status_code == 200
+                and payload.get("ok") is True
+                and payload.get("updated") == 1
+                and payload.get("review_required") is True
+            )
+        except (requests.RequestException, ValueError):
             return False
 
     def _mark_pending_review(self, cookie_id: str, chat_id: str, user_id: str, 
                              item_id: str, message: str, intent: str):
         """标记为待人工审核"""
         try:
-            db_manager.conn.execute('''
-                INSERT INTO pending_reviews (cookie_id, chat_id, user_id, item_id, message, intent, status)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending')
-            ''', (cookie_id, chat_id, user_id, item_id, message, intent))
-            db_manager.conn.commit()
-            logger.info(f"消息已标记为待审核: {intent} - {message[:30]}")
+            with db_manager.lock:
+                db_manager.conn.execute('''
+                    INSERT INTO pending_reviews (cookie_id, chat_id, user_id, item_id, message, intent, status)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                ''', (cookie_id, chat_id, user_id, item_id, message, intent))
+                db_manager.conn.commit()
+            logger.info(f"消息已标记为待审核: intent={intent}, length={len(message)}")
         except Exception as e:
-            logger.error(f"标记待审核失败: {e}")
+            logger.error(f"标记待审核失败: {type(e).__name__}")
+
+    def _answer_verified_inventory_fact(
+        self,
+        message: str,
+        item_info: dict,
+        chat_id: str,
+        cookie_id: str,
+        user_id: str,
+        item_id: str,
+    ) -> Optional[str]:
+        """在任何意图、关键词或模型逻辑之前处理库存事实。"""
+        if not self._requires_inventory_facts(message):
+            return None
+        try:
+            self._load_knowledge_base(force_refresh=True)
+            reply = self._build_verified_inventory_reply(
+                message, str(item_info.get("title") or "")
+            )
+        except Exception as exc:
+            logger.error(f"飞书群聊文件库存读取失败，禁止回答库存事实: {type(exc).__name__}")
+            self._mark_pending_review(
+                cookie_id, chat_id, user_id, item_id, message, "inventory_unavailable"
+            )
+            reply = "我这边暂时查不到飞书库存，为避免报错信息，先帮你转人工确认。"
+        self.save_conversation(chat_id, cookie_id, user_id, item_id, "user", message, "inventory")
+        self.save_conversation(
+            chat_id, cookie_id, user_id, item_id, "assistant", reply, "inventory"
+        )
+        logger.info(f"使用飞书群聊文件实时库存确定性回复: length={len(reply)}")
+        return reply
 
     def generate_reply(self, message: str, item_info: dict, chat_id: str,
                       cookie_id: str, user_id: str, item_id: str) -> Optional[str]:
         """生成AI回复"""
+        verified_inventory_reply = self._answer_verified_inventory_fact(
+            message, item_info, chat_id, cookie_id, user_id, item_id
+        )
+        if verified_inventory_reply is not None:
+            return verified_inventory_reply
         if not self.is_ai_enabled(cookie_id):
             return None
-        
+
         try:
             # 1. 获取AI回复设置（继承全局默认）
             settings = self._get_merged_settings(cookie_id)
@@ -1375,7 +1788,32 @@ class AIReplyEngine:
             max_discount_percent = settings.get('max_discount_percent', 10)
             max_discount_amount = settings.get('max_discount_amount', 100)
 
-            knowledge = self._load_knowledge_base()
+            try:
+                knowledge = self._load_knowledge_base(force_refresh=True)
+            except Exception as exc:
+                logger.error(f"飞书群聊文件库存读取失败，禁止回答库存事实: {type(exc).__name__}")
+                if self._requires_inventory_facts(message):
+                    self._mark_pending_review(
+                        cookie_id, chat_id, user_id, item_id, message, "inventory_unavailable"
+                    )
+                    safe_reply = "我这边暂时查不到飞书库存，为避免报错信息，先帮你转人工确认。"
+                    self.save_conversation(chat_id, cookie_id, user_id, item_id, "user", message, intent)
+                    self.save_conversation(
+                        chat_id, cookie_id, user_id, item_id, "assistant", safe_reply, intent
+                    )
+                    return safe_reply
+                knowledge = "（飞书群聊文件库存当前不可用；禁止提供任何具体库存、价格、码数或配件信息）"
+
+            verified_inventory_reply = self._build_verified_inventory_reply(
+                message, str(item_info.get("title") or "")
+            )
+            if verified_inventory_reply:
+                self.save_conversation(chat_id, cookie_id, user_id, item_id, "user", message, intent)
+                self.save_conversation(
+                    chat_id, cookie_id, user_id, item_id, "assistant", verified_inventory_reply, intent
+                )
+                logger.info(f"使用飞书群聊文件实时库存确定性回复: {verified_inventory_reply}")
+                return verified_inventory_reply
 
             user_prompt = f"""商品信息：
 {item_desc}
@@ -1421,16 +1859,11 @@ class AIReplyEngine:
             if intent == "price":
                 self.increment_bargain_count(chat_id, cookie_id)
             
-            logger.info(f"AI回复生成成功 (账号: {cookie_id}): {reply}")
+            logger.info(f"AI回复生成成功 (账号: {cookie_id}, length={len(reply)})")
             return reply
             
         except Exception as e:
-            logger.error(f"AI回复生成失败 {cookie_id}: {e}")
-            # 打印更详细的错误信息
-            if hasattr(e, 'response') and hasattr(e.response, 'url'):
-                logger.error(f"请求URL: {e.response.url}")
-            if hasattr(e, 'request') and hasattr(e.request, 'url'):
-                logger.error(f"请求URL: {e.request.url}")
+            logger.error(f"AI回复生成失败 {cookie_id}: error_type={type(e).__name__}")
             return None
     
     def get_conversation_context(self, chat_id: str, cookie_id: str, limit: int = 20) -> List[Dict]:
@@ -1449,7 +1882,7 @@ class AIReplyEngine:
                 context = [{"role": row[0], "content": row[1]} for row in reversed(results)]
                 return context
         except Exception as e:
-            logger.error(f"获取对话上下文失败: {e}")
+            logger.error(f"获取对话上下文失败: {type(e).__name__}")
             return []
     
     def save_conversation(self, chat_id: str, cookie_id: str, user_id: str, 
@@ -1465,7 +1898,7 @@ class AIReplyEngine:
                 ''', (cookie_id, chat_id, user_id, item_id, role, content, intent))
                 db_manager.conn.commit()
         except Exception as e:
-            logger.error(f"保存对话记录失败: {e}")
+            logger.error(f"保存对话记录失败: {type(e).__name__}")
     
     def get_bargain_count(self, chat_id: str, cookie_id: str) -> int:
         """获取议价次数"""
@@ -1480,7 +1913,7 @@ class AIReplyEngine:
                 result = cursor.fetchone()
                 return result[0] if result else 0
         except Exception as e:
-            logger.error(f"获取议价次数失败: {e}")
+            logger.error(f"获取议价次数失败: {type(e).__name__}")
             return 0
     
     def increment_bargain_count(self, chat_id: str, cookie_id: str):

@@ -16,6 +16,7 @@ import qrcode
 import qrcode.constants
 from loguru import logger
 import hashlib
+import threading
 
 
 def generate_headers():
@@ -49,8 +50,9 @@ class NotLoginError(Exception):
 class QRLoginSession:
     """二维码登录会话"""
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, owner_user_id: int):
         self.session_id = session_id
+        self.owner_user_id = owner_user_id
         self.status = 'waiting'  # waiting, scanned, success, expired, cancelled, verification_required
         self.qr_code_url = None
         self.qr_content = None
@@ -81,6 +83,7 @@ class QRLoginManager:
 
     def __init__(self):
         self.sessions: Dict[str, QRLoginSession] = {}
+        self._sessions_lock = threading.RLock()
         self.headers = generate_headers()
         self.host = "https://passport.goofish.com"
         self.api_mini_login = f"{self.host}/mini_login.htm"
@@ -198,12 +201,12 @@ class QRLoginManager:
                 logger.error("获取登录参数时连接错误")
                 raise
     
-    async def generate_qr_code(self) -> Dict[str, Any]:
-        """生成二维码"""
+    async def generate_qr_code(self, owner_user_id: int) -> Dict[str, Any]:
+        """生成绑定到当前用户的二维码。"""
         try:
             # 创建新的会话
             session_id = str(uuid.uuid4())
-            session = QRLoginSession(session_id)
+            session = QRLoginSession(session_id, owner_user_id)
 
             # 1. 获取m_h5_tk
             await self._get_mh5tk(session)
@@ -220,14 +223,13 @@ class QRLoginManager:
                     params=login_params,
                     headers=self.headers
                 )
-                logger.debug(f"[调试] 获取二维码接口原始响应: {resp.text}")
+                logger.debug(f"二维码接口响应状态: {resp.status_code}")
 
                 try:
                     results = resp.json()
-                    logger.debug(f"[调试] 获取二维码接口解析后: {json.dumps(results, ensure_ascii=False)}")
-                except Exception as e:
+                except Exception:
                     logger.exception("二维码接口返回不是JSON")
-                    raise GetLoginQRCodeError(f"二维码接口返回异常: {resp.text}")
+                    raise GetLoginQRCodeError("二维码接口返回格式异常")
 
                 if results.get("content", {}).get("success") == True:
                     # 更新会话参数
@@ -264,7 +266,8 @@ class QRLoginManager:
                     session.status = 'waiting'
 
                     # 保存会话
-                    self.sessions[session_id] = session
+                    with self._sessions_lock:
+                        self.sessions[session_id] = session
 
                     # 启动状态检查任务
                     asyncio.create_task(self._monitor_qr_status(session_id))
@@ -287,17 +290,17 @@ class QRLoginManager:
         except httpx.ConnectError as e:
             logger.error(f"连接错误: {e}")
             return {'success': False, 'message': f'连接错误，请检查网络或代理设置'}
-        except Exception as e:
+        except Exception:
             logger.exception("二维码生成过程中发生异常")
-            return {'success': False, 'message': f'生成二维码失败: {str(e)}'}
+            return {'success': False, 'message': '生成二维码失败'}
     
-    async def _poll_qrcode_status(self, session: QRLoginSession) -> httpx.Response:
+    async def _poll_qrcode_status(self, params: dict, cookies: dict) -> httpx.Response:
         """获取二维码扫描状态"""
         async with httpx.AsyncClient(follow_redirects=True, timeout=self.timeout, proxy=self.proxy) as client:
             resp = await client.post(
                 self.api_scan_status,
-                data=session.params,
-                cookies=session.cookies,
+                data=params,
+                cookies=cookies,
                 headers=self.headers,
             )
             return resp
@@ -305,7 +308,8 @@ class QRLoginManager:
     async def _monitor_qr_status(self, session_id: str):
         """监控二维码状态"""
         try:
-            session = self.sessions.get(session_id)
+            with self._sessions_lock:
+                session = self.sessions.get(session_id)
             if not session:
                 return
 
@@ -317,73 +321,53 @@ class QRLoginManager:
 
             while time.time() - start_time < max_wait_time:
                 try:
-                    # 检查会话是否还存在
-                    if session_id not in self.sessions:
-                        break
-
-                    # 轮询二维码状态
-                    resp = await self._poll_qrcode_status(session)
-                    qrcode_status = (
-                        resp.json()
-                        .get("content", {})
-                        .get("data", {})
-                        .get("qrCodeStatus")
-                    )
-
-                    if qrcode_status == "CONFIRMED":
-                        # 登录确认
-                        if (
-                            resp.json()
-                            .get("content", {})
-                            .get("data", {})
-                            .get("iframeRedirect")
-                            is True
-                        ):
-                            # 账号被风控，需要手机验证
-                            session.status = 'verification_required'
-                            iframe_url = (
-                                resp.json()
-                                .get("content", {})
-                                .get("data", {})
-                                .get("iframeRedirectUrl")
-                            )
-                            session.verification_url = iframe_url
-                            logger.warning(f"账号被风控，需要手机验证: {session_id}, URL: {iframe_url}")
+                    with self._sessions_lock:
+                        if self.sessions.get(session_id) is not session:
                             break
-                        else:
-                            # 登录成功
-                            session.status = 'success'
+                        params = dict(session.params)
+                        cookies = dict(session.cookies)
 
-                            # 保存Cookie
-                            for k, v in resp.cookies.items():
-                                session.cookies[k] = v
-                                if k == 'unb':
-                                    session.unb = v
+                    # 网络请求必须在会话锁外执行。
+                    resp = await self._poll_qrcode_status(params, cookies)
+                    response_data = resp.json().get("content", {}).get("data", {})
+                    qrcode_status = response_data.get("qrCodeStatus")
+                    should_break = False
+                    log_message = None
 
-                            logger.info(f"扫码登录成功: {session_id}, UNB: {session.unb}")
+                    with self._sessions_lock:
+                        if self.sessions.get(session_id) is not session:
                             break
 
-                    elif qrcode_status == "NEW":
-                        # 二维码未被扫描，继续轮询
-                        continue
+                        if qrcode_status == "CONFIRMED":
+                            if response_data.get("iframeRedirect") is True:
+                                session.status = 'verification_required'
+                                session.verification_url = response_data.get("iframeRedirectUrl")
+                                log_message = ("warning", f"账号被风控，需要手机验证: {session_id}")
+                            else:
+                                session.status = 'success'
+                                for k, v in resp.cookies.items():
+                                    session.cookies[k] = v
+                                    if k == 'unb':
+                                        session.unb = v
+                                log_message = ("info", f"扫码登录成功: {session_id}")
+                            should_break = True
+                        elif qrcode_status == "EXPIRED":
+                            session.status = 'expired'
+                            log_message = ("info", f"二维码已过期: {session_id}")
+                            should_break = True
+                        elif qrcode_status == "SCANED":
+                            if session.status == 'waiting':
+                                session.status = 'scanned'
+                                log_message = ("info", f"二维码已扫描，等待确认: {session_id}")
+                        elif qrcode_status != "NEW":
+                            session.status = 'cancelled'
+                            log_message = ("info", f"用户取消登录: {session_id}")
+                            should_break = True
 
-                    elif qrcode_status == "EXPIRED":
-                        # 二维码已过期
-                        session.status = 'expired'
-                        logger.info(f"二维码已过期: {session_id}")
+                    if log_message:
+                        getattr(logger, log_message[0])(log_message[1])
+                    if should_break:
                         break
-
-                    elif qrcode_status == "SCANED":
-                        # 二维码已被扫描，等待确认
-                        if session.status == 'waiting':
-                            session.status = 'scanned'
-                            logger.info(f"二维码已扫描，等待确认: {session_id}")
-                    else:
-                        # 用户取消确认
-                        session.status = 'cancelled'
-                        logger.info(f"用户取消登录: {session_id}")
-                        break
-
                     await asyncio.sleep(0.8)  # 每0.8秒检查一次
 
                 except Exception as e:
@@ -391,61 +375,93 @@ class QRLoginManager:
                     await asyncio.sleep(2)
 
             # 超时处理
-            if session.status not in ['success', 'expired', 'cancelled', 'verification_required']:
-                session.status = 'expired'
+            timed_out = False
+            with self._sessions_lock:
+                if (
+                    self.sessions.get(session_id) is session
+                    and session.status not in ['success', 'expired', 'cancelled', 'verification_required']
+                ):
+                    session.status = 'expired'
+                    timed_out = True
+            if timed_out:
                 logger.info(f"二维码监控超时，标记为过期: {session_id}")
 
         except Exception as e:
             logger.error(f"监控二维码状态失败: {e}")
-            if session_id in self.sessions:
-                self.sessions[session_id].status = 'expired'
+            with self._sessions_lock:
+                session = self.sessions.get(session_id)
+                if session:
+                    session.status = 'expired'
     
-    def get_session_status(self, session_id: str) -> Dict[str, Any]:
-        """获取会话状态"""
-        session = self.sessions.get(session_id)
-        if not session:
-            return {'status': 'not_found'}
+    def _get_owned_session(self, session_id: str, owner_user_id: int) -> Optional[QRLoginSession]:
+        with self._sessions_lock:
+            session = self.sessions.get(session_id)
+            if not session or session.owner_user_id != owner_user_id:
+                return None
+            return session
 
-        if session.is_expired() and session.status != 'success':
-            session.status = 'expired'
+    def get_session_status(self, session_id: str, owner_user_id: int) -> Dict[str, Any]:
+        """获取当前用户拥有的会话状态，不返回 Cookie。"""
+        with self._sessions_lock:
+            session = self._get_owned_session(session_id, owner_user_id)
+            if not session:
+                return {'status': 'not_found'}
 
-        result = {
-            'status': session.status,
-            'session_id': session_id
-        }
+            if session.is_expired() and session.status != 'success':
+                session.status = 'expired'
 
-        # 如果需要验证，返回验证URL
-        if session.status == 'verification_required' and session.verification_url:
-            result['verification_url'] = session.verification_url
-            result['message'] = '账号被风控，需要手机验证'
+            result = {
+                'status': session.status,
+                'session_id': session_id
+            }
 
-        # 如果登录成功，返回Cookie信息
-        if session.status == 'success' and session.cookies and session.unb:
-            result['cookies'] = self._cookie_marshal(session.cookies)
-            result['unb'] = session.unb
+            # 如果需要验证，返回验证URL
+            if session.status == 'verification_required' and session.verification_url:
+                result['verification_url'] = session.verification_url
+                result['message'] = '账号被风控，需要手机验证'
 
-        return result
+            return result
 
     def cleanup_expired_sessions(self):
         """清理过期会话"""
-        expired_sessions = []
-        for session_id, session in self.sessions.items():
-            if session.is_expired():
-                expired_sessions.append(session_id)
+        with self._sessions_lock:
+            expired_sessions = [
+                session_id
+                for session_id, session in self.sessions.items()
+                if session.is_expired()
+            ]
+            for session_id in expired_sessions:
+                self._destroy_session_locked(session_id)
 
         for session_id in expired_sessions:
-            del self.sessions[session_id]
             logger.info(f"清理过期会话: {session_id}")
 
-    def get_session_cookies(self, session_id: str) -> Optional[Dict[str, str]]:
-        """获取会话Cookie"""
-        session = self.sessions.get(session_id)
-        if session and session.status == 'success':
-            return {
-                'cookies': self._cookie_marshal(session.cookies),
+    def consume_session_cookies(self, session_id: str, owner_user_id: int) -> Optional[Dict[str, str]]:
+        """一次性消费当前用户会话 Cookie，并立即销毁敏感会话。"""
+        with self._sessions_lock:
+            session = self._get_owned_session(session_id, owner_user_id)
+            if not session or session.status != 'success':
+                return None
+            result = {
+                'cookies': self._cookie_marshal(dict(session.cookies)),
                 'unb': session.unb
             }
-        return None
+            self.destroy_session(session_id)
+            return result
+
+    def _destroy_session_locked(self, session_id: str) -> None:
+        session = self.sessions.pop(session_id, None)
+        if session:
+            session.cookies.clear()
+            session.params.clear()
+            session.qr_content = None
+            session.qr_code_url = None
+            session.verification_url = None
+            session.unb = None
+
+    def destroy_session(self, session_id: str) -> None:
+        with self._sessions_lock:
+            self._destroy_session_locked(session_id)
 
 # 全局二维码登录管理器实例
 qr_login_manager = QRLoginManager()

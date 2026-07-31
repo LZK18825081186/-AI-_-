@@ -6,8 +6,15 @@ services:
     image: xianyu-auto-reply:latest
     container_name: xianyu-auto-reply
     restart: unless-stopped
-    # 使用root用户避免权限问题
-    user: "0:0"
+    user: "10001:10001"
+    read_only: true
+    cap_drop: ["ALL"]
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m,uid=10001,gid=10001,mode=1770
+      - /home/app/.cache:rw,noexec,nosuid,size=256m,uid=10001,gid=10001,mode=0700
+    security_opt:
+      - no-new-privileges:true
     logging:
       driver: "json-file"
       options:
@@ -20,28 +27,42 @@ services:
       - ./data:/app/data:rw
       - ./logs:/app/logs:rw
       - ./global_config.yml:/app/global_config.yml:ro
+      # 容器访问宿主机飞书桥接服务；飞书用户凭据不进入容器
       # 可选：如果需要自定义配置
       # - ./custom_config.yml:/app/global_config.yml:ro
       # 可选：备份目录
       - ./backups:/app/backups:rw
+      - ./static/uploads/images:/app/static/uploads/images:rw
     environment:
       # 运行时基础配置
       - PYTHONUNBUFFERED=1
       - PYTHONDONTWRITEBYTECODE=1
       - TZ=${TZ:-Asia/Shanghai}
-      # 数据库路径
-      - DB_PATH=${DB_PATH:-/app/data/xianyu_data.db}
-      # 管理后台（通过 .env 修改）
-      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
+      # 数据库与 AI 缓存路径
+      - DB_PATH=/app/data/xianyu_data.db
+      - AI_CACHE_DIR=/app/data
+      # 管理后台凭证必须通过 .env 显式配置
+      - ADMIN_USERNAME=${ADMIN_USERNAME:?Set ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?Set ADMIN_PASSWORD}
       - TOKEN_EXPIRE_TIME=${TOKEN_EXPIRE_TIME:-86400}
-      # DeepSeek API
+      - XIANYU_MESSAGE_API_KEY=${XIANYU_MESSAGE_API_KEY:-}
+      # DeepSeek 部署变量；AI 回复仍需在管理后台保存用户级设置
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
-      # 远程图片理解模型（可选）
-      - LM_STUDIO_URL=${LM_STUDIO_URL:-}
+      # 阿里云百炼千问图片理解
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
+      - QWEN_API_BASE_URL=${QWEN_API_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      - QWEN_VL_MODEL=${QWEN_VL_MODEL:-qwen-vl-plus}
+      - QWEN_TEXT_MODEL=${QWEN_TEXT_MODEL:-qwen-plus}
+      - QWEN_REQUEST_TIMEOUT=${QWEN_REQUEST_TIMEOUT:-60}
+      - QWEN_MAX_RETRIES=${QWEN_MAX_RETRIES:-2}
+      - QWEN_MAX_IMAGE_BYTES=${QWEN_MAX_IMAGE_BYTES:-4194304}
+      - QWEN_MAX_IMAGE_DIMENSION=${QWEN_MAX_IMAGE_DIMENSION:-2048}
+      - QWEN_MAX_PRODUCT_IMAGES=${QWEN_MAX_PRODUCT_IMAGES:-6}
       # 飞书多维表格库存
       - FEISHU_BASE_TOKEN=${FEISHU_BASE_TOKEN:-}
       - FEISHU_TABLE_ID=${FEISHU_TABLE_ID:-}
+      - FEISHU_INVENTORY_BRIDGE_URL=${FEISHU_INVENTORY_BRIDGE_URL:-http://host.docker.internal:8765}
+      - FEISHU_INVENTORY_BRIDGE_TOKEN=${FEISHU_INVENTORY_BRIDGE_TOKEN:-}
       # CookieCloud（浏览器插件自动同步Cookie）
       - COOKIE_CLOUD_HOST=${COOKIE_CLOUD_HOST:-http://cookiecloud:8088}
       - COOKIE_CLOUD_UUID=${COOKIE_CLOUD_UUID:-}
@@ -59,25 +80,25 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-    # 资源限制
-    deploy:
-      resources:
-        limits:
-          memory: ${MEMORY_LIMIT:-1}G
-          cpus: '${CPU_LIMIT:-1.0}'
-        reservations:
-          memory: ${MEMORY_RESERVATION:-512}M
-          cpus: '${CPU_RESERVATION:-0.5}'
+    # 普通 docker compose 运行时限制
+    mem_limit: ${MEMORY_LIMIT:-1536m}
+    cpus: ${CPU_LIMIT:-1.50}
 
   # 内置 CookieCloud 服务（同步浏览器闲鱼 Cookie）
   cookiecloud:
     image: easychen/cookiecloud:latest
     container_name: xianyu-cookiecloud
     restart: unless-stopped
+    profiles: ["cookiecloud"]
     ports:
-      - "8088:8088"
+      - "${COOKIECLOUD_BIND_ADDRESS:-127.0.0.1}:8088:8088"
     networks:
       - xianyu-network
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.50
+    security_opt:
+      - no-new-privileges:true
 
   # 可选：添加Nginx反向代理
   nginx:
@@ -96,6 +117,11 @@ services:
       - xianyu-network
     profiles:
       - with-nginx
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.25
+    security_opt:
+      - no-new-privileges:true
 
 networks:
   xianyu-network:

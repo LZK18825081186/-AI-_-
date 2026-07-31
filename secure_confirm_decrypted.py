@@ -38,11 +38,15 @@ class SecureConfirm:
         self.token_refresh_interval = 3600  # 1小时
 
     def _safe_str(self, obj):
-        """安全字符串转换"""
-        try:
-            return str(obj)
-        except:
-            return "无法转换的对象"
+        """仅返回异常类型，避免异常文本携带请求参数或响应正文。"""
+        return type(obj).__name__
+
+    @staticmethod
+    def _mask_id(value):
+        text = str(value or "")
+        if len(text) <= 4:
+            return "***"
+        return f"{text[:2]}***{text[-2:]}"
 
     async def _get_real_item_id(self):
         """从数据库中获取一个真实的商品ID"""
@@ -122,7 +126,7 @@ class SecureConfirm:
         token = trans_cookies(self.cookies_str).get('_m_h5_tk', '').split('_')[0] if trans_cookies(self.cookies_str).get('_m_h5_tk') else ''
 
         if token:
-            logger.info(f"使用cookies中的_m_h5_tk token: {token}")
+            logger.debug("Cookie 签名 Token 可用")
         else:
             logger.warning("cookies中没有找到_m_h5_tk token")
 
@@ -130,7 +134,7 @@ class SecureConfirm:
         params['sign'] = sign
 
         try:
-            logger.info(f"【{self.cookie_id}】开始自动确认发货，订单ID: {order_id}")
+            logger.info(f"【{self.cookie_id}】开始自动确认发货，订单ID: {self._mask_id(order_id)}")
             async with self.session.post(
                 'https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/',
                 params=params,
@@ -155,15 +159,18 @@ class SecureConfirm:
                         await self._update_config_cookies()
                         logger.debug("已更新Cookie到数据库")
 
-                logger.info(f"【{self.cookie_id}】自动确认发货响应: {res_json}")
+                ret_code = res_json.get('ret', ['UNKNOWN'])[0] if res_json.get('ret') else 'UNKNOWN'
+                logger.info(
+                    f"【{self.cookie_id}】自动确认发货响应已解析: "
+                    f"http_status={response.status}, success={ret_code == 'SUCCESS::调用成功'}"
+                )
 
                 # 检查响应结果
                 if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
-                    logger.info(f"【{self.cookie_id}】✅ 自动确认发货成功，订单ID: {order_id}")
+                    logger.info(f"【{self.cookie_id}】✅ 自动确认发货成功，订单ID: {self._mask_id(order_id)}")
                     return {"success": True, "order_id": order_id}
                 else:
-                    error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
-                    logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
+                    logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: api_ret_present={bool(res_json.get('ret'))}")
 
                     return await self.auto_confirm(order_id, item_id, retry_count + 1)
 

@@ -29,23 +29,32 @@ class FileLogCollector:
     
     def setup_file_monitoring(self):
         """设置文件监控"""
-        # 查找日志文件
-        possible_files = [
-            "xianyu.log",
-            "app.log", 
-            "system.log",
-            "logs/xianyu.log",
-            "logs/app.log"
-        ]
-        
-        for file_path in possible_files:
-            if os.path.exists(file_path):
-                self.log_file = file_path
-                break
-        
-        if not self.log_file:
-            # 如果没有找到现有文件，创建一个新的
-            self.log_file = "realtime.log"
+        configured_log_file = os.getenv("LOG_FILE_PATH", "").strip()
+        if configured_log_file:
+            log_path = Path(configured_log_file).expanduser()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_file = str(log_path)
+        else:
+            # 查找日志文件
+            possible_files = [
+                "xianyu.log",
+                "app.log",
+                "system.log",
+                "logs/xianyu.log",
+                "logs/app.log"
+            ]
+
+            for file_path in possible_files:
+                if os.path.exists(file_path):
+                    self.log_file = file_path
+                    break
+
+            if not self.log_file:
+                logs_dir = Path("logs")
+                if logs_dir.is_dir() and os.access(logs_dir, os.W_OK):
+                    self.log_file = str(logs_dir / "realtime.log")
+                else:
+                    self.log_file = "realtime.log"
             
         # 设置loguru输出到文件
         self.setup_loguru_file_output()

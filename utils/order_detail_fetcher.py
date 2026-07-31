@@ -40,11 +40,12 @@ class OrderDetailFetcher:
     # 类级别的锁字典，为每个order_id维护一个锁
     _order_locks = defaultdict(lambda: asyncio.Lock())
 
-    def __init__(self, cookie_string: str = None, headless: bool = True):
+    def __init__(self, cookie_string: str = None, headless: bool = True, cookie_id: str = ""):
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
-        self.headless = headless  # 保存headless设置
+        self.headless = headless
+        self.cookie_id = cookie_id
 
         # 请求头配置
         self.headers = {
@@ -197,8 +198,8 @@ class OrderDetailFetcher:
         Returns:
             包含订单详情的字典，失败时返回None
         """
-        # 获取该订单ID的锁
-        order_lock = self._order_locks[order_id]
+        lock_key = (self.cookie_id, order_id) if self.cookie_id else order_id
+        order_lock = self._order_locks[lock_key]
 
         async with order_lock:
             logger.info(f"🔒 获取订单 {order_id} 的锁，开始处理...")
@@ -206,7 +207,7 @@ class OrderDetailFetcher:
             try:
                 # 首先查询数据库中是否已存在该订单（在初始化浏览器之前）
                 from db_manager import db_manager
-                existing_order = db_manager.get_order_by_id(order_id)
+                existing_order = db_manager.get_order_by_id(order_id, cookie_id=cookie_id)
 
                 if existing_order:
                     # 检查金额字段是否有效（不为空且不为0）
@@ -643,7 +644,7 @@ class OrderDetailFetcher:
 
 
 # 便捷函数
-async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, headless: bool = True) -> Optional[Dict[str, Any]]:
+async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, headless: bool = True, cookie_id: str = "") -> Optional[Dict[str, Any]]:
     """
     简单的订单详情获取函数（优化版：先检查数据库，再初始化浏览器）
 
@@ -668,7 +669,7 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
     # 先检查数据库中是否有有效数据
     try:
         from db_manager import db_manager
-        existing_order = db_manager.get_order_by_id(order_id)
+        existing_order = db_manager.get_order_by_id(order_id, cookie_id=cookie_id)
 
         if existing_order:
             # 检查金额字段是否有效
@@ -717,7 +718,7 @@ async def fetch_order_detail_simple(order_id: str, cookie_string: str = None, he
     logger.info(f"🌐 订单 {order_id} 需要浏览器获取，开始初始化浏览器...")
     print(f"🔍 订单 {order_id} 开始浏览器获取详情...")
 
-    fetcher = OrderDetailFetcher(cookie_string, headless)
+    fetcher = OrderDetailFetcher(cookie_string, headless, cookie_id=cookie_id)
     try:
         if await fetcher.init_browser(headless=headless):
             return await fetcher.fetch_order_detail(order_id)

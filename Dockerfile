@@ -74,19 +74,19 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+# 安装Playwright浏览器。该层仅依赖 requirements.txt，源码变更可复用构建缓存。
+RUN playwright install-deps chromium && \
+    playwright install chromium
+
 # 复制项目文件
 COPY . .
 
-# 安装Playwright浏览器（必须在复制项目文件之后）
-RUN playwright install chromium && \
-    playwright install-deps chromium
-
-# 创建必要的目录并设置权限
-RUN mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
-    chmod 777 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images
-
-# 注意: 为了简化权限问题，使用root用户运行
-# 在生产环境中，建议配置适当的用户映射
+# 使用固定 UID/GID，便于宿主机以最小权限准备持久化目录。
+RUN groupadd --gid 10001 app && \
+    useradd --uid 10001 --gid 10001 --create-home --home-dir /home/app --shell /usr/sbin/nologin app && \
+    mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
+    chown -R 10001:10001 /app/logs /app/data /app/backups /app/static/uploads && \
+    chmod 0750 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images
 
 # 暴露端口
 EXPOSE 8080
@@ -96,7 +96,9 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 # 设置启动脚本权限（entrypoint.sh 已由 COPY . . 复制）
-RUN chmod +x /app/entrypoint.sh
+RUN chmod 0755 /app/entrypoint.sh
+
+USER 10001:10001
 
 # 启动命令（使用ENTRYPOINT确保脚本被执行）
 ENTRYPOINT ["/bin/bash", "/app/entrypoint.sh"]

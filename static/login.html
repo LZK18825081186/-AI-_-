@@ -494,30 +494,11 @@
         </a>
       </div>
 
-      <!-- 默认账号提示 -->
       <div id="defaultLoginInfo" class="mt-4 p-3 bg-light rounded-3">
-        <div class="text-center">
-          <small class="text-muted">
-            <i class="bi bi-info-circle me-1"></i>
-            默认登录账号
-          </small>
-        </div>
-        <div class="mt-2">
-          <div class="d-flex justify-content-between align-items-center mb-1">
-            <small class="text-muted">用户名：</small>
-            <code class="bg-white px-2 py-1 rounded">admin</code>
-          </div>
-          <div class="d-flex justify-content-between align-items-center">
-            <small class="text-muted">密码：</small>
-            <code class="bg-white px-2 py-1 rounded">admin123</code>
-          </div>
-        </div>
-        <div class="text-center mt-2">
-          <button type="button" class="btn btn-sm btn-outline-primary" onclick="fillDefaultCredentials()">
-            <i class="bi bi-arrow-down-circle me-1"></i>
-            使用默认账号
-          </button>
-        </div>
+        <small class="text-muted">
+          <i class="bi bi-shield-lock me-1"></i>
+          使用部署配置中设置的管理员账号和密码登录。
+        </small>
       </div>
 
     </div>
@@ -552,28 +533,6 @@
       }
     }
 
-    // 填充默认登录凭据
-    function fillDefaultCredentials() {
-      document.getElementById('username').value = 'admin';
-      document.getElementById('password').value = 'admin123';
-      hideError();
-
-      // 添加一个小动画效果
-      const usernameInput = document.getElementById('username');
-      const passwordInput = document.getElementById('password');
-
-      usernameInput.style.borderColor = 'var(--accent)';
-      passwordInput.style.borderColor = 'var(--accent)';
-      usernameInput.style.boxShadow = '0 0 12px var(--accent-glow)';
-      passwordInput.style.boxShadow = '0 0 12px var(--accent-glow)';
-
-      setTimeout(() => {
-        usernameInput.style.borderColor = '';
-        passwordInput.style.borderColor = '';
-        usernameInput.style.boxShadow = '';
-        passwordInput.style.boxShadow = '';
-      }, 1000);
-    }
     
     loginForm.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -660,11 +619,9 @@
 
           // 检查是否有重定向URL
           const redirectUrl = localStorage.getItem('redirectAfterLogin');
-          if (redirectUrl) {
-            // 清除重定向URL
-            localStorage.removeItem('redirectAfterLogin');
-            // 跳转到原来的页面
-            window.location.href = redirectUrl;
+          localStorage.removeItem('redirectAfterLogin');
+          if (redirectUrl && redirectUrl.startsWith('/') && !redirectUrl.startsWith('//')) {
+            window.location.assign(redirectUrl);
           } else {
             // 默认跳转到管理页面
             window.location.href = '/admin';
@@ -708,7 +665,12 @@
 
     // 生成会话ID
     function generateSessionId() {
-      return 'session_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return `session_${window.crypto.randomUUID()}`;
+      }
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      return `session_${Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')}`;
     }
 
     // 登录方式切换
@@ -803,10 +765,12 @@
         const result = await response.json();
 
         if (result.success) {
-          captchaStatus.innerHTML = '<span style="color: #2dd4bf;">✓ 图形验证码验证成功</span>';
+          captchaStatus.textContent = '图形验证码验证成功';
+          captchaStatus.style.color = '#2dd4bf';
           captchaVerified = true;
         } else {
-          captchaStatus.innerHTML = '<span style="color: #f87171;">✗ 图形验证码错误，请重新输入</span>';
+          captchaStatus.textContent = '图形验证码错误，请重新输入';
+          captchaStatus.style.color = '#f87171';
           captchaVerified = false;
           refreshCaptcha(); // 自动刷新验证码
         }
@@ -815,7 +779,8 @@
 
       } catch (error) {
         console.error('验证图形验证码失败:', error);
-        captchaStatus.innerHTML = '<span style="color: #f87171;">验证失败，请检查网络连接</span>';
+        captchaStatus.textContent = '验证失败，请检查网络连接';
+        captchaStatus.style.color = '#f87171';
         captchaVerified = false;
         updateSendCodeButton();
       }
@@ -859,7 +824,8 @@
       countdownTimer = setInterval(() => {
         countdownSeconds--;
         sendCodeBtn.textContent = `重新发送 (${countdownSeconds}s)`;
-        codeStatus.innerHTML = `<span class="countdown">验证码已发送，${countdownSeconds}秒后可重新发送</span>`;
+        codeStatus.textContent = `验证码已发送，${countdownSeconds}秒后可重新发送`;
+        codeStatus.className = 'countdown';
 
         if (countdownSeconds <= 0) {
           clearInterval(countdownTimer);
@@ -905,6 +871,7 @@
         const result = await response.json();
 
         if (result.success) {
+          captchaVerified = false;
           startCountdown();
         } else {
           showError(result.message);

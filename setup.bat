@@ -47,13 +47,13 @@ if not exist ".env" (
     echo   ✅ .env 已创建，请编辑填入 API Key:
     echo.
     echo [重要] 请填入以下必填项后保存关闭:
-    echo   - DEEPSEEK_API_KEY    （DeepSeek API 密钥）
-    echo   - ADMIN_USERNAME       （管理后台用户名）
-    echo   - ADMIN_PASSWORD       （管理后台密码）
-    echo   - JWT_SECRET_KEY       （随机密钥）
+    echo   - DASHSCOPE_API_KEY     （商品图片描述使用的阿里云百炼密钥）
+    echo   - ADMIN_USERNAME        （管理后台用户名）
+    echo   - ADMIN_PASSWORD        （管理后台密码）
+    echo   - XIANYU_MESSAGE_API_KEY（至少 32 个随机字节）
     echo.
-    echo   [可选] 如需远程图片理解模型:
-    echo   - LM_STUDIO_URL        （如 http://192.168.1.100:1234）
+    echo   AI 回复还需在管理后台保存 DeepSeek 账号设置并启用。
+    echo   商品图片描述仅使用阿里云百炼千问 API。
     echo.
     start notepad .env
     echo   等待编辑完成...（关闭记事本后继续）

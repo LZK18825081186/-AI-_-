@@ -28,9 +28,9 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-where docker-compose >nul 2>&1
+docker compose version >nul 2>&1
 if %errorlevel% neq 0 (
-    echo %ERROR_PREFIX% Docker Compose 未安装，请先安装 Docker Compose
+    echo %ERROR_PREFIX% Docker Compose v2 插件不可用，请更新 Docker Desktop
     pause
     exit /b 1
 )
@@ -86,78 +86,64 @@ goto build_and_start
 echo %INFO_PREFIX% 构建 Docker 镜像...
 set /p use_cn="是否使用国内镜像源？(y/n): "
 if /i "!use_cn!"=="y" (
-    docker-compose -f docker-compose-cn.yml build --no-cache
+    docker compose -f docker-compose-cn.yml build --no-cache
 ) else (
-    docker-compose build --no-cache
+    docker compose build --no-cache
 )
-if %errorlevel% neq 0 (
+if !errorlevel! neq 0 (
     echo %ERROR_PREFIX% 镜像构建失败
     pause
     exit /b 1
 )
 echo %SUCCESS_PREFIX% 镜像构建完成
-goto end
+exit /b 0
 
 :build_and_start
 call :build_image
-if %errorlevel% neq 0 exit /b 1
+if !errorlevel! neq 0 exit /b 1
 
 :start_services
-echo %INFO_PREFIX% 启动服务...
-docker-compose up -d
-if %errorlevel% neq 0 (
-    echo %ERROR_PREFIX% 服务启动失败
-    docker-compose logs
+echo %INFO_PREFIX% 启动服务并等待健康检查...
+docker compose up -d --wait --wait-timeout 180
+if !errorlevel! neq 0 (
+    echo %ERROR_PREFIX% 服务未在 180 秒内达到健康状态
+    docker compose ps
+    docker compose logs
     pause
     exit /b 1
 )
 
-echo %SUCCESS_PREFIX% 服务启动完成
-
-REM 等待服务就绪
-echo %INFO_PREFIX% 等待服务就绪...
-timeout /t 10 /nobreak >nul
-
-REM 检查服务状态
-docker-compose ps | findstr "Up" >nul
-if %errorlevel% equ 0 (
-    echo %SUCCESS_PREFIX% 服务运行正常
-    call :show_access_info
-) else (
-    echo %ERROR_PREFIX% 服务启动失败
-    docker-compose logs
-    pause
-    exit /b 1
-)
+echo %SUCCESS_PREFIX% 服务运行正常
+call :show_access_info
 goto end
 
 :stop_services
 echo %INFO_PREFIX% 停止服务...
-docker-compose down
+docker compose down
 echo %SUCCESS_PREFIX% 服务已停止
 goto end
 
 :restart_services
 echo %INFO_PREFIX% 重启服务...
-docker-compose restart
+docker compose restart
 echo %SUCCESS_PREFIX% 服务已重启
 goto end
 
 :show_status
 echo %INFO_PREFIX% 服务状态:
-docker-compose ps
+docker compose ps
 echo.
 echo %INFO_PREFIX% 资源使用:
-for /f "tokens=*" %%i in ('docker-compose ps -q') do (
+for /f "tokens=*" %%i in ('docker compose ps -q') do (
     docker stats --no-stream %%i
 )
 goto end
 
 :show_logs
 if "%2"=="" (
-    docker-compose logs -f
+    docker compose logs -f
 ) else (
-    docker-compose logs -f %2
+    docker compose logs -f %2
 )
 goto end
 
@@ -166,7 +152,7 @@ echo %WARNING_PREFIX% 这将删除所有容器、镜像和数据，确定要继�
 set /p confirm="请输入 y 确认: "
 if /i "!confirm!"=="y" (
     echo %INFO_PREFIX% 清理环境...
-    docker-compose down -v --rmi all
+    docker compose down -v --rmi all
     rmdir /s /q data logs backups 2>nul
     echo %SUCCESS_PREFIX% 环境清理完成
 ) else (
@@ -181,9 +167,8 @@ echo.
 echo 📱 访问地址:
 echo    HTTP: http://localhost:8080
 echo.
-echo 🔐 默认登录信息:
-echo    用户名: admin
-echo    密码:   admin123
+echo 🔐 登录信息:
+echo    使用 .env 中显式配置的 ADMIN_USERNAME 和 ADMIN_PASSWORD
 echo.
 echo 📊 管理命令:
 echo    查看状态: %~nx0 status

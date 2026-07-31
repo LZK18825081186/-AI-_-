@@ -85,14 +85,22 @@ static/uploads/*
 !static/uploads/images/
 static/uploads/images/*
 !static/uploads/images/.gitkeep
+# Linux 生产编排使用根目录 uploads/，运行时内容不得进入版本库
+uploads/*
+!uploads/.gitkeep
+!uploads/images/
+uploads/images/*
+!uploads/images/.gitkeep
 
 # 配置文件（包含敏感信息）
 config.local.yml
 global_config.local.yml
 
-# 测试文件
+# 临时测试脚本；根目录的正式生产合同检查显式保留
 test_*.py
 *_test.py
+!production_contract_checks.py
+!qwen_feishu_review_tests.py
 keywords_sample.xlsx
 
 # 备份文件
@@ -307,13 +315,14 @@ mock_*.py
 debug_*.py
 *_debug.py
 
-# 测试相关目录
-tests/
+# 测试相关目录（项目回归测试必须纳入版本管理）
 test/
 testing/
 __tests__/
 spec/
 specs/
+!tests/
+!tests/test_*.py
 
 # 测试配置文件
 pytest.ini
@@ -397,6 +406,7 @@ tox.ini
 docker-compose.*.yml
 !docker-compose.yml
 !docker-compose-cn.yml
+!docker-compose.linux.yml
 
 # 安全相关
 *.secret
@@ -423,6 +433,7 @@ monitoring/
 .env
 .env.*
 !.env.example
+!.env.linux.example
 
 # 数据导出文件
 export_*.csv
@@ -545,6 +556,7 @@ poetry.lock
 .env
 .env.*
 !.env.example
+!.env.linux.example
 config.local.*
 settings.local.*
 

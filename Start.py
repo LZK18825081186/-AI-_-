@@ -297,9 +297,8 @@ async def main():
     print("主程序启动完成，保持运行...")
     print("=" * 55)
     print("  管理后台: http://localhost:8080")
-    print("  默认账号: admin")
-    print("  默认密码: admin123")
-    print("  首次登录后请在后台修改密码并配置 AI Key")
+    print("  请使用部署环境中配置的管理员凭据登录")
+    print("  AI 与飞书密钥仅通过受保护的环境配置提供")
     print("=" * 55)
     await asyncio.Event().wait()
 

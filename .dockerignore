@@ -68,6 +68,7 @@ tmp/
 test_*.py
 *_test.py
 tests/
+production_contract_checks.py
 
 # 文档
 *.md
